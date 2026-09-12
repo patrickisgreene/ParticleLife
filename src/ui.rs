@@ -56,7 +56,7 @@ pub struct Controls {
 impl Default for Controls {
     fn default() -> Self {
         Self {
-            count: std::env::var("PL_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000),
+            count: 50_000,
             types: 8,
             selected: (0, 0),
             rule_kind: RuleKind::Attraction,
@@ -102,6 +102,7 @@ enum Action {
     Randomize,
     Zero,
     Universe,
+    ResetGenomes,
     Kind(RuleKind),
     Palette(usize),
     Cycle(u32),
@@ -120,6 +121,8 @@ enum Toggle {
     Preferred,
     Density,
     Trails,
+    Detection,
+    Evolution,
 }
 #[derive(Component, Clone, Copy)]
 enum Info {
@@ -150,6 +153,8 @@ enum Gate {
     Neighbors,
     Trails,
     Step,
+    Detection,
+    Evolution,
 }
 
 fn text(commands: &mut Commands, parent: Entity, value: impl Into<String>) -> Entity {
@@ -416,7 +421,12 @@ fn setup(mut commands: Commands, mut focus: ResMut<InputFocus>) {
         "Count changes regenerate interaction rules. Seed and clustering apply on reset.",
     );
     let motion = sub(&mut commands, bodies[0], "Motion");
-    for f in [Field::Radius, Field::Strength, Field::Damping, Field::SampleBudget] {
+    for f in [
+        Field::Radius,
+        Field::Strength,
+        Field::Damping,
+        Field::SampleBudget,
+    ] {
         slider(&mut commands, motion, f);
     }
     let color = sub(&mut commands, bodies[1], "Color & light");
@@ -453,6 +463,44 @@ fn setup(mut commands: Commands, mut focus: ResMut<InputFocus>) {
         Action::ResetView,
         RoundedCorners::All,
     );
+    let detection = sub(&mut commands, bodies[1], "Creatures");
+    check(
+        &mut commands,
+        detection,
+        "Detect and outline creatures",
+        Toggle::Detection,
+    );
+    text(
+        &mut commands,
+        detection,
+        "Groups particles the rules hold together into bodies and draws an outline around each one. Bond distance and body size are inferred from the interaction rules, not set here. A body holds its inferred minimum in every type it contains (floored at four), so a few stray particles of one kind inside another don't count. Labels take a few steps to settle, so outlines trail sudden changes.",
+    );
+    for f in [Field::PromoteSteps, Field::OutlineVisibility] {
+        slider(&mut commands, detection, f);
+    }
+    let evolution = sub(&mut commands, bodies[1], "Evolution");
+    check(
+        &mut commands,
+        evolution,
+        "Adaptive bodies",
+        Toggle::Evolution,
+    );
+    text(
+        &mut commands,
+        evolution,
+        "Each body carries an anisotropic kernel per interaction kind. Its measured shape steers how it feels its own kind, and a tracked body that splits apart leaves a child inheriting mutated genes. When free particles run short the least durable body is scattered back into free material.",
+    );
+    for f in [Field::Mutation, Field::CullFree, Field::Influence] {
+        slider(&mut commands, evolution, f);
+    }
+    let reset_genomes = button(
+        &mut commands,
+        evolution,
+        "Reset genomes",
+        Action::ResetGenomes,
+        RoundedCorners::All,
+    );
+    commands.entity(reset_genomes).insert(Gate::Evolution);
     let trails = sub(&mut commands, bodies[1], "Chemical trails");
     check(
         &mut commands,
@@ -643,6 +691,8 @@ enum Field {
     DensityTarget,
     DensityStrength,
     SampleBudget,
+    PromoteSteps,
+    OutlineVisibility,
     CycleSeconds,
     CycleFraction,
     CycleMin,
@@ -652,6 +702,9 @@ enum Field {
     Diffusion,
     Sensor,
     Visibility,
+    Mutation,
+    CullFree,
+    Influence,
     Rule,
 }
 impl Field {
@@ -666,6 +719,8 @@ impl Field {
             Self::DensityTarget => "Target neighbors",
             Self::DensityStrength => "Crowding strength",
             Self::SampleBudget => "Sample budget",
+            Self::PromoteSteps => "Steps before tracking",
+            Self::OutlineVisibility => "Outline visibility",
             Self::CycleSeconds => "Interval / cooldown (s)",
             Self::CycleFraction => "Next-type fraction",
             Self::CycleMin => "Minimum neighbors",
@@ -675,6 +730,9 @@ impl Field {
             Self::Diffusion => "Diffusion",
             Self::Sensor => "Sensing distance",
             Self::Visibility => "Trail visibility",
+            Self::Mutation => "Mutation rate",
+            Self::CullFree => "Cull free fraction",
+            Self::Influence => "Genome influence",
             Self::Rule => "Selected rule value",
         }
     }
@@ -689,6 +747,8 @@ impl Field {
             Self::DensityTarget => (1.0, 512.0),
             Self::DensityStrength => (0.0, 2.0),
             Self::SampleBudget => (16.0, 256.0),
+            Self::PromoteSteps => (1.0, 240.0),
+            Self::OutlineVisibility => (0.0, 2.0),
             Self::CycleSeconds => (0.5, 30.0),
             Self::CycleFraction => (0.05, 1.0),
             Self::CycleMin => (1.0, 128.0),
@@ -698,6 +758,9 @@ impl Field {
             Self::Diffusion => (0.0, 30.0),
             Self::Sensor => (4.0, 96.0),
             Self::Visibility => (0.0, 1.0),
+            Self::Mutation => (0.0, 0.5),
+            Self::CullFree => (0.0, 0.25),
+            Self::Influence => (0.0, 2.0),
             Self::Rule => {
                 if kind == RuleKind::Distance {
                     (0., 0.95)
@@ -720,6 +783,11 @@ impl Field {
             Self::Diffusion => Some(Gate::Trails),
             Self::Sensor => Some(Gate::Trails),
             Self::Visibility => Some(Gate::Trails),
+            Self::PromoteSteps => Some(Gate::Detection),
+            Self::OutlineVisibility => Some(Gate::Detection),
+            Self::Mutation => Some(Gate::Evolution),
+            Self::CullFree => Some(Gate::Evolution),
+            Self::Influence => Some(Gate::Evolution),
             _ => None,
         }
     }
@@ -734,6 +802,8 @@ impl Field {
             Self::DensityTarget => s.behavior.density_target,
             Self::DensityStrength => s.behavior.density_strength,
             Self::SampleBudget => s.behavior.sample_budget as f32,
+            Self::PromoteSteps => s.detection.promote_steps as f32,
+            Self::OutlineVisibility => s.detection.outline,
             Self::CycleSeconds => s.behavior.cycle_seconds,
             Self::CycleFraction => s.behavior.cycle_fraction,
             Self::CycleMin => s.behavior.cycle_min_neighbors as f32,
@@ -743,6 +813,9 @@ impl Field {
             Self::Diffusion => s.trails.diffusion,
             Self::Sensor => s.trails.sensor_distance,
             Self::Visibility => s.trails.visibility,
+            Self::Mutation => s.evolution.mutation,
+            Self::CullFree => s.evolution.cull_free_fraction,
+            Self::Influence => s.evolution.influence,
             Self::Rule => s.matrix(c.rule_kind)[(c.selected.0 * s.types + c.selected.1) as usize],
         }
     }
@@ -759,6 +832,8 @@ impl Field {
             Self::DensityTarget => s.behavior.density_target = value,
             Self::DensityStrength => s.behavior.density_strength = value,
             Self::SampleBudget => s.behavior.sample_budget = value.round() as u32,
+            Self::PromoteSteps => s.detection.promote_steps = value.round() as u32,
+            Self::OutlineVisibility => s.detection.outline = value,
             Self::CycleSeconds => s.behavior.cycle_seconds = value,
             Self::CycleFraction => s.behavior.cycle_fraction = value,
             Self::CycleMin => s.behavior.cycle_min_neighbors = value.round() as u32,
@@ -768,6 +843,9 @@ impl Field {
             Self::Diffusion => s.trails.diffusion = value,
             Self::Sensor => s.trails.sensor_distance = value,
             Self::Visibility => s.trails.visibility = value,
+            Self::Mutation => s.evolution.mutation = value,
+            Self::CullFree => s.evolution.cull_free_fraction = value,
+            Self::Influence => s.evolution.influence = value,
             Self::Rule => s.set_rule(
                 c.rule_kind,
                 (c.selected.0 * s.types + c.selected.1) as usize,
@@ -782,6 +860,8 @@ fn enabled(gate: Gate, s: &Simulation) -> bool {
         Gate::Cycle => s.behavior.cycle_mode != 0,
         Gate::Neighbors => s.behavior.cycle_mode >= 2,
         Gate::Trails => s.trails.enabled,
+        Gate::Detection => s.detection.enabled,
+        Gate::Evolution => s.detection.enabled && s.evolution.enabled,
         Gate::Step => s.paused,
     }
 }
@@ -838,6 +918,7 @@ fn activate(
             a.zoom = 1.;
         }
         Action::ClearTrails => s.trails.clear_revision += 1,
+        Action::ResetGenomes => s.evolution.evolution_revision += 1,
         Action::Randomize => {
             s.seed = hash(s.seed);
             s.randomize_matrix(c.rule_kind);
@@ -913,6 +994,8 @@ fn bool_change(event: On<ValueChange<bool>>, fields: Query<&Toggle>, mut s: ResM
                 s.trails.clear_revision += 1;
             }
         }
+        Toggle::Detection => s.detection.enabled = event.value,
+        Toggle::Evolution => s.evolution.enabled = event.value,
     }
 }
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -990,6 +1073,8 @@ fn sync(
             Toggle::Preferred => s.behavior.preferred_enabled,
             Toggle::Density => s.behavior.density_enabled,
             Toggle::Trails => s.trails.enabled,
+            Toggle::Detection => s.detection.enabled,
+            Toggle::Evolution => s.evolution.enabled,
         };
         if value != checked {
             if value {
@@ -1657,10 +1742,11 @@ mod tests {
             ..default()
         };
         let revision = s.rules_revision;
+        let index = (c.selected.0 * s.types + c.selected.1) as usize;
         Field::Rule.set(-0.5, &mut s, &mut a, &c);
-        assert_eq!(s.matrix(RuleKind::Distance)[10], 0.);
+        assert_eq!(s.matrix(RuleKind::Distance)[index], 0.);
         assert_eq!(s.rules_revision, revision + 1);
         Field::Rule.set(1., &mut s, &mut a, &c);
-        assert_eq!(s.matrix(RuleKind::Distance)[10], 0.95);
+        assert_eq!(s.matrix(RuleKind::Distance)[index], 0.95);
     }
 }

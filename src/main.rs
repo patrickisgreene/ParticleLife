@@ -1,5 +1,8 @@
+mod creatures;
 mod gpu;
 mod model;
+#[cfg(test)]
+mod creature_tests;
 #[cfg(test)]
 mod trail_tests;
 mod ui;

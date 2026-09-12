@@ -24,7 +24,7 @@ fn chemical_field_wraps_decays_deposits_once_and_clears() {
                 include_str!("../assets/shaders/simulation.wgsl").into(),
             ),
         });
-        let mut params = [0u32; 48];
+        let mut params = [0u32; 56];
         params[4] = 0.25f32.to_bits(); // dt
         params[25] = 2.0f32.to_bits(); // deposit per second
         params[26] = 2.0f32.to_bits(); // diffusion rate
@@ -151,7 +151,13 @@ fn particle_spacing_crowding_and_cycles() {
     pollster::block_on(async {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance.request_adapter(&Default::default()).await.unwrap();
-        let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(
@@ -178,7 +184,7 @@ fn particle_spacing_crowding_and_cycles() {
                    next_fraction: f32|
          -> Vec<u32> {
             let n = xs.len() as u32;
-            let mut params = [0u32; 48];
+            let mut params = [0u32; 56];
             params[..4].copy_from_slice(&[n, type_count, 3, 42]);
             params[4] = 0.02f32.to_bits();
             params[5] = 40.0f32.to_bits();
@@ -236,6 +242,11 @@ fn particle_spacing_crowding_and_cycles() {
                 types,
                 vec![0; 16],
                 particles.clone(),
+                // Creature registry and per-creature genomes. Detection is off
+                // here, but `update` still references both bindings, so they
+                // must be present in the layout.
+                vec![0; 4096 * 36],
+                vec![0; 4096 * 16 * 2],
             ];
             let buffers: Vec<_> = contents
                 .iter()
