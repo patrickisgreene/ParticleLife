@@ -1,0 +1,19 @@
+[package]
+name = "particle-life"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.19.1", default-features = false, features = ["default_app", "std", "multi_threaded", "bevy_winit", "x11", "wayland", "2d_bevy_render", "tonemapping_luts", "zstd_rust", "bevy_feathers", "bevy_scene", "ui_bevy_render", "ui_picking", "keyboard", "mouse", "png"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+wgpu = { version = "29", default-features = false, features = ["vulkan", "wgsl", "std"] }
+pollster = "0.4"
+naga = { version = "29", features = ["wgsl-in"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
