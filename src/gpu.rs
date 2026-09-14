@@ -1,5 +1,6 @@
 //! GPU state is owned by the render world. Particle data never crosses back to
 //! the CPU during normal use; the display renderer consumes the same buffers.
+use crate::interaction::*;
 use crate::model::*;
 use bevy::{
     core_pipeline::schedule::camera_driver,
@@ -23,6 +24,7 @@ impl Plugin for ParticleGpuPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
             ExtractResourcePlugin::<Simulation>::default(),
+            ExtractResourcePlugin::<InteractionTools>::default(),
             ExtractResourcePlugin::<Appearance>::default(),
             ExtractResourcePlugin::<Status>::default(),
             ExtractResourcePlugin::<DisplayTarget>::default(),
@@ -47,28 +49,48 @@ struct Params {
     behavior: Vec4,
     cycle: Vec4,
     sampling: Vec4,
-    detect: Vec4,
-    outline: Vec4,
-    evolution: Vec4,
+    brush: Vec4,
+    interaction: Vec4,
+    nova: Vec4,
 }
 impl Params {
-    fn new(
-        s: &Simulation,
-        a: &Appearance,
-        alpha: f32,
-        generation: u64,
-        detect: Vec4,
-        outline: Vec4,
-    ) -> Self {
+    fn with_tools(mut self, tools: &InteractionTools) -> Self {
+        if let Some(cursor) = tools.cursor {
+            self.brush = Vec4::new(
+                cursor.x,
+                cursor.y,
+                tools.radius,
+                if tools.active {
+                    tools.strength * tools.tool.brush_sign()
+                } else {
+                    0.
+                },
+            );
+            self.interaction.x = if tools.tool == Tool::Dump {
+                2.
+            } else {
+                tools.tool.brush_sign()
+            };
+        }
+        self
+    }
+
+    fn new(s: &Simulation, a: &Appearance, alpha: f32, generation: u64) -> Self {
         let (origin, tiles) = a.visible_tiles();
         Self {
-            detect,
-            outline,
-            evolution: Vec4::new(
-                if s.evolution.enabled { 1.0 } else { 0.0 },
-                s.evolution.mutation,
-                s.evolution.cull_free_fraction,
-                s.evolution.influence,
+            brush: Vec4::ZERO,
+            interaction: Vec4::ZERO,
+            // A zero threshold disables ignition, the same way a zero gain
+            // disables the density term below.
+            nova: Vec4::new(
+                if s.behavior.nova_enabled {
+                    s.behavior.nova_threshold
+                } else {
+                    0.0
+                },
+                s.behavior.nova_radius,
+                s.behavior.nova_impulse,
+                s.behavior.nova_duration,
             ),
             // y carries the vertical tile count; the splat kernel needs both axes,
             // while the raster path infers it from the instance count.
@@ -129,8 +151,7 @@ struct Pipelines {
     background: CachedRenderPipelineId,
     splat: CachedComputePipelineId,
     resolve: CachedRenderPipelineId,
-    outline_splat: CachedComputePipelineId,
-    outline: CachedRenderPipelineId,
+    interaction: CachedRenderPipelineId,
 }
 fn buffer_entry(
     binding: u32,
@@ -150,7 +171,7 @@ fn buffer_entry(
 }
 /// Compute entry points, indexed by the constants below. Append new kernels to
 /// the end so the existing indices stay valid.
-const KERNELS: [&str; 24] = [
+const KERNELS: [&str; 10] = [
     "init",
     "clear",
     "count",
@@ -161,20 +182,6 @@ const KERNELS: [&str; 24] = [
     "clear_trails",
     "diffuse_trails",
     "commit_trails",
-    "clear_creatures",
-    "bond",
-    "resolve",
-    "creature_stats",
-    "promote",
-    "reset_evolution",
-    "progeny",
-    "creature_frame",
-    "promote_frame",
-    "count_free",
-    "cull_select",
-    "cull_release",
-    "pick_split",
-    "apply_split",
 ];
 const KERNEL_INIT: usize = 0;
 const KERNEL_GRID: usize = 1;
@@ -183,31 +190,13 @@ const KERNEL_UPDATE: usize = 6;
 const KERNEL_CLEAR_TRAILS: usize = 7;
 const KERNEL_DIFFUSE_TRAILS: usize = 8;
 const KERNEL_COMMIT_TRAILS: usize = 9;
-const KERNEL_CLEAR_CREATURES: usize = 10;
-const KERNEL_BOND: usize = 11;
-const KERNEL_RESOLVE: usize = 12;
-const KERNEL_STATS: usize = 13;
-const KERNEL_PROMOTE: usize = 14;
-const KERNEL_RESET_EVOLUTION: usize = 15;
-const KERNEL_PROGENY: usize = 16;
-const KERNEL_FRAME: usize = 17;
-const KERNEL_PROMOTE_FRAME: usize = 18;
-const KERNEL_COUNT_FREE: usize = 19;
-const KERNEL_CULL_SELECT: usize = 20;
-const KERNEL_CULL_RELEASE: usize = 21;
-const KERNEL_PICK_SPLIT: usize = 22;
-const KERNEL_APPLY_SPLIT: usize = 23;
-/// Pointer-jump passes per step. Each doubles the merge depth that collapses in
-/// one step; four covers chains of 16, and anything deeper finishes next step.
-const RESOLVE_PASSES: usize = 4;
-
 fn setup_pipelines(mut commands: Commands, assets: Res<AssetServer>, cache: Res<PipelineCache>) {
     let mut entries = vec![buffer_entry(
         0,
         ShaderStages::COMPUTE,
         BufferBindingType::Uniform,
     )];
-    entries.extend((1..=11).map(|i| {
+    entries.extend((1..=8).map(|i| {
         buffer_entry(
             i,
             ShaderStages::COMPUTE,
@@ -244,16 +233,6 @@ fn setup_pipelines(mut commands: Commands, assets: Res<AssetServer>, cache: Res<
                 5,
                 ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
                 BufferBindingType::Storage { read_only: false },
-            ),
-            buffer_entry(
-                6,
-                ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
-                BufferBindingType::Storage { read_only: false },
-            ),
-            buffer_entry(
-                7,
-                ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
-                BufferBindingType::Storage { read_only: true },
             ),
         ],
     );
@@ -294,11 +273,7 @@ fn setup_pipelines(mut commands: Commands, assets: Res<AssetServer>, cache: Res<
     let mut resolve_descriptor = descriptor.clone();
     resolve_descriptor.label = Some("splat resolve".into());
     resolve_descriptor.vertex.entry_point = Some("resolve_vertex".into());
-    resolve_descriptor
-        .fragment
-        .as_mut()
-        .unwrap()
-        .entry_point = Some("resolve_fragment".into());
+    resolve_descriptor.fragment.as_mut().unwrap().entry_point = Some("resolve_fragment".into());
     let resolve = cache.queue_render_pipeline(resolve_descriptor);
     let splat = cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("particle splat".into()),
@@ -307,19 +282,15 @@ fn setup_pipelines(mut commands: Commands, assets: Res<AssetServer>, cache: Res<
         entry_point: Some("splat".into()),
         ..default()
     });
-    let mut outline_descriptor = descriptor.clone();
-    outline_descriptor.label = Some("creature outlines".into());
-    outline_descriptor.vertex.entry_point = Some("background_vertex".into());
-    outline_descriptor.fragment.as_mut().unwrap().entry_point = Some("outline_fragment".into());
-    let outline = cache.queue_render_pipeline(outline_descriptor);
-    let outline_splat = cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("creature outline field".into()),
-        layout: vec![draw_layout.clone()],
-        shader: descriptor.vertex.shader.clone(),
-        entry_point: Some("outline_splat".into()),
-        ..default()
-    });
     let background = cache.queue_render_pipeline(background_descriptor);
+    let mut interaction_descriptor = descriptor.clone();
+    interaction_descriptor.vertex.entry_point = Some("background_vertex".into());
+    interaction_descriptor
+        .fragment
+        .as_mut()
+        .unwrap()
+        .entry_point = Some("interaction_fragment".into());
+    let interaction = cache.queue_render_pipeline(interaction_descriptor);
     let draw = cache.queue_render_pipeline(descriptor);
     commands.insert_resource(Pipelines {
         compute_layout,
@@ -329,8 +300,7 @@ fn setup_pipelines(mut commands: Commands, assets: Res<AssetServer>, cache: Res<
         background,
         splat,
         resolve,
-        outline_splat,
-        outline,
+        interaction,
     });
 }
 
@@ -344,16 +314,12 @@ struct Buffers {
     chemicals: Buffer,
     accumulation: Buffer,
     accumulation_pixels: u32,
-    creatures: Buffer,
-    genomes: Buffer,
-    births: Buffer,
-    field: Buffer,
     trail_revision: u64,
     epoch: u64,
     grid_side: u32,
     rules_revision: u64,
     palette: usize,
-    evolution_revision: u64,
+    last_dump: u64,
 }
 fn storage(device: &RenderDevice, label: &'static str, size: u64) -> Buffer {
     device.create_buffer(&BufferDescriptor {
@@ -386,30 +352,94 @@ impl Buffers {
             // not be zero-length.
             accumulation: storage(device, "splat accumulation", 16),
             accumulation_pixels: 0,
-            creatures: storage(
-                device,
-                "creature registry",
-                u64::from(MAX_CREATURES) * CREATURE_BYTES,
-            ),
-            // One vec2 (ratio, orientation) per creature per interaction kind,
-            // plus a leading words region; sized for the full rule cache cap.
-            genomes: storage(
-                device,
-                "creature genomes",
-                u64::from(MAX_CREATURES) * u64::from(CREATURE_TYPES) * 8,
-            ),
-            // One marker/id pair per creature id for the split pass; the pair is
-            // rewritten every step while detection runs, so zero is just the
-            // boot state.
-            births: storage(device, "creature birth plans", u64::from(MAX_CREATURES) * 8),
-            field: storage(device, "creature occupancy field", FIELD_BYTES),
             trail_revision: s.trails.clear_revision,
             epoch: s.epoch,
             grid_side: s.grid_side(),
             rules_revision: 0,
             palette: usize::MAX,
-            evolution_revision: 0,
+            last_dump: 0,
         }
+    }
+    fn append_dumps(
+        &mut self,
+        context: &mut RenderContext,
+        device: &RenderDevice,
+        sim: &Simulation,
+        tools: &InteractionTools,
+        status: &Status,
+    ) {
+        if tools.epoch != sim.epoch {
+            return;
+        }
+        let capacity = self.particles[0].size() / 32;
+        if u64::from(sim.count) > capacity {
+            let proposed = u64::from(sim.count)
+                .max(capacity + capacity / 2)
+                .min(u64::from(u32::MAX)) as u32;
+            let capacity =
+                if validate_counts(proposed, sim.types, &status.0.lock().unwrap()).is_ok() {
+                    proposed
+                } else {
+                    sim.count
+                };
+            for (old, label) in self
+                .particles
+                .iter_mut()
+                .zip(["particles A", "particles B"])
+            {
+                let next = storage(device, label, u64::from(capacity) * 32);
+                context
+                    .command_encoder()
+                    .copy_buffer_to_buffer(old, 0, &next, 0, old.size());
+                *old = next;
+            }
+            let sorted = storage(device, "cell-sorted particles", u64::from(capacity) * 32);
+            context.command_encoder().copy_buffer_to_buffer(
+                &self.sorted,
+                0,
+                &sorted,
+                0,
+                self.sorted.size(),
+            );
+            self.sorted = sorted;
+            self.neighbors = storage(device, "packed neighbor records", u64::from(capacity) * 16);
+        }
+        for batch in &tools.pending {
+            if batch.serial <= self.last_dump {
+                continue;
+            }
+            if batch
+                .start
+                .checked_add(batch.count)
+                .is_none_or(|end| end > sim.count)
+            {
+                continue;
+            }
+            let data = batch.particles(sim.seed, sim.types);
+            let bytes = bytemuck::cast_slice(&data);
+            let upload = device.create_buffer(&BufferDescriptor {
+                label: Some("particle brush upload"),
+                size: bytes.len() as u64,
+                usage: BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            });
+            upload
+                .slice(..)
+                .get_mapped_range_mut()
+                .copy_from_slice(bytes);
+            upload.unmap();
+            for destination in [&self.particles[0], &self.particles[1], &self.sorted] {
+                context.command_encoder().copy_buffer_to_buffer(
+                    &upload,
+                    0,
+                    destination,
+                    u64::from(batch.start) * 32,
+                    bytes.len() as u64,
+                );
+            }
+            self.last_dump = batch.serial;
+        }
+        status.0.lock().unwrap().dump_ack = (sim.epoch, self.last_dump);
     }
     fn compute_group(
         &self,
@@ -431,9 +461,6 @@ impl Buffers {
                 self.types.as_entire_binding(),
                 self.chemicals.as_entire_binding(),
                 self.sorted.as_entire_binding(),
-                self.creatures.as_entire_binding(),
-                self.genomes.as_entire_binding(),
-                self.births.as_entire_binding(),
             )),
         )
     }
@@ -457,8 +484,6 @@ impl Buffers {
                 self.types.as_entire_binding(),
                 self.chemicals.as_entire_binding(),
                 self.accumulation.as_entire_binding(),
-                self.field.as_entire_binding(),
-                self.creatures.as_entire_binding(),
             )),
         )
     }
@@ -502,6 +527,7 @@ fn simulate_and_draw(
     cache: Res<PipelineCache>,
     sim: Res<Simulation>,
     appearance: Res<Appearance>,
+    tools: Res<InteractionTools>,
     target: Res<DisplayTarget>,
     images: Res<RenderAssets<GpuImage>>,
     status: Res<Status>,
@@ -533,6 +559,9 @@ fn simulate_and_draw(
             }
         }
     }
+    let Some(interaction_pipeline) = cache.get_render_pipeline(pipelines.interaction) else {
+        return;
+    };
     let Some(draw_pipeline) = cache.get_render_pipeline(pipelines.draw) else {
         status.0.lock().unwrap().message = format!(
             "Preparing particle renderer: {:?}",
@@ -558,38 +587,9 @@ fn simulate_and_draw(
         status.0.lock().unwrap().message = "Compiling particle splat…".into();
         return;
     };
-    let Some(outline_pipeline) = cache.get_render_pipeline(pipelines.outline) else {
-        status.0.lock().unwrap().message = format!(
-            "Preparing creature outlines: {:?}",
-            cache.get_render_pipeline_state(pipelines.outline)
-        );
-        return;
-    };
-    let Some(outline_splat_pipeline) = cache.get_compute_pipeline(pipelines.outline_splat) else {
-        status.0.lock().unwrap().message = "Compiling creature outlines…".into();
-        return;
-    };
     let Some(image) = images.get(&target.0) else {
         return;
     };
-    // Derived from the rule matrices, so recomputed only as often as the frame.
-    let detect = sim.detection.enabled;
-    let detect_params = Vec4::new(
-        crate::creatures::bond_radius(&sim),
-        crate::creatures::min_particles(&sim) as f32,
-        sim.detection.promote_steps as f32,
-        if detect { 1.0 } else { 0.0 },
-    );
-    // Stamp radius and isolevel both derive from the inferred rest spacing, so the
-    // outline tracks the rule set instead of a tuned constant.
-    let (stamp, isolevel) = crate::creatures::outline_geometry(&sim, FIELD_SIDE);
-    let outlines = detect && sim.detection.outline > 0.0;
-    let outline_params = Vec4::new(
-        stamp,
-        isolevel,
-        if outlines { sim.detection.outline } else { 0.0 },
-        FIELD_SIDE as f32,
-    );
     let reset = state.buffers.as_ref().is_none_or(|b| b.epoch != sim.epoch);
     if reset {
         state.buffers = Some(Buffers::new(&device, &sim));
@@ -625,7 +625,7 @@ fn simulate_and_draw(
         let params = uniform(
             &device,
             &queue,
-            Params::new(&sim, &appearance, 1.0, state.generation, detect_params, outline_params),
+            Params::new(&sim, &appearance, 1.0, state.generation).with_tools(&tools),
         );
         let group = state.buffers.as_ref().unwrap().compute_group(
             &device,
@@ -645,7 +645,7 @@ fn simulate_and_draw(
         pass.dispatch_workgroups((TRAIL_SIDE * TRAIL_SIDE).div_ceil(256), 1, 1);
     }
     if reset {
-        let params = uniform(&device, &queue, Params::new(&sim, &appearance, 1.0, 0, detect_params, outline_params));
+        let params = uniform(&device, &queue, Params::new(&sim, &appearance, 1.0, 0));
         let group =
             state
                 .buffers
@@ -664,47 +664,12 @@ fn simulate_and_draw(
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(sim.count.div_ceil(256), 1, 1);
         }
-        // A fresh epoch also clears every genome back to isotropic, along with
-        // the newborn history each slot accumulates, so recycled ids do not carry
-        // an old body's line into the new world.
-        {
-            let mut pass = context
-                .command_encoder()
-                .begin_compute_pass(&ComputePassDescriptor::default());
-            pass.set_pipeline(
-                cache
-                    .get_compute_pipeline(pipelines.compute[KERNEL_RESET_EVOLUTION])
-                    .unwrap(),
-            );
-            pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups(MAX_CREATURES.div_ceil(256), 1, 1);
-        }
     }
-    let genome_reset = state.buffers.as_ref().unwrap().evolution_revision != sim.evolution.evolution_revision;
-    if genome_reset {
-        state.buffers.as_mut().unwrap().evolution_revision = sim.evolution.evolution_revision;
-        let params = uniform(
-            &device,
-            &queue,
-            Params::new(&sim, &appearance, 1.0, state.generation, detect_params, outline_params),
-        );
-        let group = state.buffers.as_ref().unwrap().compute_group(
-            &device,
-            &compute_layout,
-            &params,
-            state.current,
-        );
-        let mut pass = context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor::default());
-        pass.set_pipeline(
-            cache
-                .get_compute_pipeline(pipelines.compute[KERNEL_RESET_EVOLUTION])
-                .unwrap(),
-        );
-        pass.set_bind_group(0, &group, &[]);
-        pass.dispatch_workgroups(MAX_CREATURES.div_ceil(256), 1, 1);
-    }
+    state
+        .buffers
+        .as_mut()
+        .unwrap()
+        .append_dumps(&mut context, &device, &sim, &tools, &status);
     let manual_steps = sim.step.saturating_sub(state.last_step).min(4) as u32;
     state.last_step = sim.step;
     if sim.paused {
@@ -723,7 +688,7 @@ fn simulate_and_draw(
         let params = uniform(
             &device,
             &queue,
-            Params::new(&sim, &appearance, 1.0, state.generation, detect_params, outline_params),
+            Params::new(&sim, &appearance, 1.0, state.generation).with_tools(&tools),
         );
         let group = state.buffers.as_ref().unwrap().compute_group(
             &device,
@@ -731,11 +696,7 @@ fn simulate_and_draw(
             &params,
             state.current,
         );
-        // Ordered explicitly rather than as a contiguous range: detection has to
-        // land between the grid build and the force pass, because `update` writes
-        // the resolved creature id into each particle.
         let particle_groups = sim.count.div_ceil(256);
-        let creature_groups = MAX_CREATURES.div_ceil(256);
         let mut schedule: Vec<(usize, u32)> = (KERNEL_GRID..=KERNEL_SCATTER)
             .map(|stage| {
                 let groups = match stage {
@@ -746,40 +707,7 @@ fn simulate_and_draw(
                 (stage, groups)
             })
             .collect();
-        if detect {
-            schedule.push((KERNEL_CLEAR_CREATURES, creature_groups));
-            schedule.push((KERNEL_BOND, particle_groups));
-            schedule.extend(
-                std::iter::repeat_n((KERNEL_RESOLVE, creature_groups), RESOLVE_PASSES),
-            );
-        }
         schedule.push((KERNEL_UPDATE, particle_groups));
-        if detect {
-            schedule.push((KERNEL_STATS, particle_groups));
-            if sim.evolution.enabled {
-                // `progeny` must see a dissolved parent's `flags` while it still
-                // reads as tracked, so it has to run before `promote` zeroes the
-                // body it left behind. That is what lets a merge pass its line on.
-                schedule.push((KERNEL_PROGENY, particle_groups));
-            }
-            schedule.push((KERNEL_PROMOTE, creature_groups));
-            if sim.evolution.enabled {
-                // Births, frame measurement and culling all need the same step's
-                // counts and centroid, so they stack behind `promote`. The order
-                // here is load-bearing: `promote` sets `centroid`, `progeny`
-                // feeds lineage, `creature_frame` consumes `centroid`, and
-                // `promote_frame` consumes both the accumulated frame and the
-                // lineage. Elongated bodies then birth a child that clears and
-                // re-tracks on its own, before the free pool is audited.
-                schedule.push((KERNEL_FRAME, particle_groups));
-                schedule.push((KERNEL_PROMOTE_FRAME, creature_groups));
-                schedule.push((KERNEL_PICK_SPLIT, creature_groups));
-                schedule.push((KERNEL_APPLY_SPLIT, particle_groups));
-                schedule.push((KERNEL_COUNT_FREE, particle_groups));
-                schedule.push((KERNEL_CULL_SELECT, creature_groups));
-                schedule.push((KERNEL_CULL_RELEASE, particle_groups));
-            }
-        }
         if sim.trails.enabled {
             let trail_groups = (TRAIL_SIDE * TRAIL_SIDE).div_ceil(256);
             schedule.push((KERNEL_DIFFUSE_TRAILS, trail_groups));
@@ -815,11 +743,11 @@ fn simulate_and_draw(
         if buffers.accumulation_pixels != pixels {
             buffers.accumulation_pixels = pixels;
             // Three u32 channels per pixel, accumulated with atomics.
-            buffers.accumulation =
-                storage(&device, "splat accumulation", u64::from(pixels) * 12);
+            buffers.accumulation = storage(&device, "splat accumulation", u64::from(pixels) * 12);
         }
     }
-    let mut display_params = Params::new(&sim, &appearance, alpha, state.generation, detect_params, outline_params);
+    let mut display_params =
+        Params::new(&sim, &appearance, alpha, state.generation).with_tools(&tools);
     // Reserved display-only component: physical target height for a constant pixel stroke.
     display_params.behavior.w = size.height as f32;
     display_params.sampling.z = size.width as f32;
@@ -845,16 +773,6 @@ fn simulate_and_draw(
             .command_encoder()
             .begin_compute_pass(&ComputePassDescriptor::default());
         pass.set_pipeline(splat_pipeline);
-        pass.set_bind_group(0, &group, &[]);
-        pass.dispatch_workgroups(sim.count.div_ceil(256), 1, 1);
-    }
-    if outlines {
-        let field = &state.buffers.as_ref().unwrap().field;
-        context.command_encoder().clear_buffer(field, 0, None);
-        let mut pass = context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor::default());
-        pass.set_pipeline(outline_splat_pipeline);
         pass.set_bind_group(0, &group, &[]);
         pass.dispatch_workgroups(sim.count.div_ceil(256), 1, 1);
     }
@@ -888,8 +806,8 @@ fn simulate_and_draw(
             let (_, tiles) = appearance.visible_tiles();
             pass.draw(0..6, 0..sim.count * tiles.x * tiles.y);
         }
-        if outlines {
-            pass.set_pipeline(outline_pipeline);
+        if tools.cursor.is_some() && tools.tool != Tool::Navigate {
+            pass.set_pipeline(interaction_pipeline);
             pass.draw(0..3, 0..1);
         }
     }

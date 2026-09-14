@@ -7,28 +7,8 @@ pub const TRAIL_BYTES: u64 = TRAIL_SIDE as u64 * TRAIL_SIDE as u64 * 64;
 pub const DT: f32 = 1.0 / 60.0;
 /// Fraction of the interaction radius below which every pair repels, regardless
 /// of its rule. `force()` in the simulation shader crosses zero exactly here, so
-/// it is also the rest separation of a bonded pair. Shared with `creatures.rs`
-/// so inferred geometry cannot drift from the shader.
+/// it is also the rest separation of a bonded pair.
 pub const CORE_FRACTION: f32 = 0.2;
-/// Creature id 0 means "unassigned", so ids run 1..MAX_CREATURES.
-pub const MAX_CREATURES: u32 = 4096;
-/// Side of the world-space occupancy field the outline contours. A texel is four
-/// world units at the default radius, against a rest spacing near five, so the
-/// Gaussian stamp rather than the resolution is what smooths the body.
-pub const FIELD_SIDE: u32 = 512;
-pub const FIELD_BYTES: u64 = FIELD_SIDE as u64 * FIELD_SIDE as u64 * 8;
-/// Types whose per-creature particle count the cluster detector tracks. Mirrors
-/// the rule-cache capacity in the simulation shader; kinds above this are not
-/// enumerated by the per-type minimum check.
-pub const CREATURE_TYPES: u32 = 16;
-/// Words per `Creature` in the simulation shader beyond the twelve-u32 base and
-/// the per-type counts: three fixed-point body-frame accumulators, a lineage id,
-/// a mutation flag, pad alignment, and the measured frame stored as a vec2
-/// (angle, aspect). Together with the base and the counts that is 36 words.
-const CREATURE_TAIL_WORDS: u64 = 8;
-/// Bytes per `Creature` in the simulation shader. The tail keeps the record at a
-/// multiple of 16 bytes so the array stride stays WebGPU-aligned.
-pub const CREATURE_BYTES: u64 = (12 + CREATURE_TYPES as u64 + CREATURE_TAIL_WORDS) * 4;
 pub const SPEED_LIMIT: f32 = 180.0;
 
 pub const PALETTES: [(&str, [u32; 8]); 4] = [
@@ -57,58 +37,6 @@ pub const PALETTES: [(&str, [u32; 8]); 4] = [
         ],
     ),
 ];
-
-/// Cluster detection: finds bodies the rules hold together and tracks them.
-#[derive(Clone)]
-pub struct Detection {
-    pub enabled: bool,
-    /// Steps a cluster must hold its size before it counts as a creature rather
-    /// than a momentary crowd. Higher values trade responsiveness for stability.
-    pub promote_steps: u32,
-    pub outline: f32,
-}
-impl Default for Detection {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            promote_steps: 30,
-            outline: 0.3,
-        }
-    }
-}
-
-/// Per-creature genomes and the selection pressure that reshapes them. Each body
-/// carries an anisotropic kernel (one major/minor ratio and orientation per
-/// interaction type) layered on the shared matrices; `promote_frame` in the
-/// shader measures the body's actual frame and blends it into the encoded one.
-/// Reproduction is a tracked cluster splitting into two viable halves, and
-/// culling dissolves the least durable body when free particles run short.
-#[derive(Clone)]
-pub struct Evolution {
-    pub enabled: bool,
-    /// How strongly a child's per-kind ratios and orientations wander from its
-    /// parent's at birth.
-    pub mutation: f32,
-    /// Fraction of the particle budget that may be free before the weakest
-    /// tracked creature is dissolved back into free material.
-    pub cull_free_fraction: f32,
-    /// How strongly creature genomes warp the shared rules: 0 keeps the rules
-    /// exactly as written, 1 applies the fully mutated kernel.
-    pub influence: f32,
-    /// Bumped to ask the GPU to reset every genome to a fresh isotropic state.
-    pub evolution_revision: u64,
-}
-impl Default for Evolution {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            mutation: 0.12,
-            cull_free_fraction: 0.02,
-            influence: 1.0,
-            evolution_revision: 0,
-        }
-    }
-}
 
 /// A shared, toroidal chemical field. Disabled by default to preserve worlds.
 #[derive(Clone)]
@@ -148,6 +76,15 @@ pub struct Behavior {
     pub cycle_seconds: f32,
     pub cycle_fraction: f32,
     pub cycle_min_neighbors: u32,
+    /// Enough same-type neighbors inside `nova_radius` and the clump ignites: the
+    /// shell is blasted outward for `nova_duration`, the core reseeds at random.
+    pub nova_enabled: bool,
+    pub nova_threshold: f32,
+    /// Fraction of the interaction radius that counts toward ignition.
+    pub nova_radius: f32,
+    pub nova_impulse: f32,
+    /// Seconds of thrust, and equally the cooldown before a particle can reignite.
+    pub nova_duration: f32,
     /// Neighbors sampled per particle per step. The force estimator's variance
     /// scales as 1/budget regardless of local density, but the visible effect of
     /// that noise shrinks as neighbor counts rise, so dense worlds tolerate far
@@ -159,13 +96,18 @@ impl Default for Behavior {
         Self {
             preferred_enabled: false,
             density_enabled: true,
-            density_target: 430.0,
-            density_strength: 0.30,
-            cycle_mode: 1,
+            density_target: 80.0,
+            density_strength: 0.32,
+            cycle_mode: 2,
             cycle_seconds: 1.0,
             cycle_fraction: 0.35,
             cycle_min_neighbors: 3,
-            sample_budget: 100,
+            nova_enabled: true,
+            nova_threshold: 24.0,
+            nova_radius: 0.35,
+            nova_impulse: 1800.0,
+            nova_duration: 0.3,
+            sample_budget: 512,
         }
     }
 }
@@ -237,13 +179,11 @@ pub struct Simulation {
     pub clustered: bool,
     pub frame_dt: f32,
     pub trails: Trails,
-    pub detection: Detection,
-    pub evolution: Evolution,
 }
 impl Default for Simulation {
     fn default() -> Self {
         Self {
-            count: 60_000,
+            count: 100_000,
             types: 32,
             seed: 42,
             epoch: 1,
@@ -261,11 +201,9 @@ impl Default for Simulation {
             strength: 90.0,
             damping: 2.0,
             exact: false,
-            clustered: true,
+            clustered: false,
             frame_dt: DT,
             trails: Trails::default(),
-            detection: Detection::default(),
-            evolution: Evolution::default(),
         }
     }
 }
@@ -377,6 +315,7 @@ impl Appearance {
 
 #[derive(Default)]
 pub struct GpuStatus {
+    pub dump_ack: (u64, u64),
     pub adapter: String,
     pub message: String,
     pub max_storage: u64,
@@ -413,8 +352,7 @@ pub fn validate_counts(count: u32, types: u32, status: &GpuStatus) -> Result<(),
     }
     // Per particle: two 32-byte ping-pong buffers the renderer interpolates
     // between, the 32-byte cell-sorted copy, and the 16-byte packed neighbor
-    // record the force loop reads. The flat allocation also covers the enlarged
-    // creature registry and the per-creature genome array.
+    // record the force loop reads, plus fixed buffer overhead.
     if u64::from(count) * PARTICLE_BYTES + rules + TRAIL_BYTES + 4_000_000 > SIMULATION_BUDGET {
         return Err(
             "Requested world exceeds the simulation memory budget. Reduce particles or types."
@@ -533,8 +471,15 @@ mod tests {
     #[test]
     fn distance_rules_and_optional_behaviors() {
         let mut sim = Simulation::default();
-        assert!(!sim.behavior.preferred_enabled && !sim.behavior.density_enabled);
-        assert_eq!(sim.behavior.cycle_mode, 0);
+        assert!(!sim.behavior.preferred_enabled);
+        assert!(sim.behavior.density_enabled);
+        assert_eq!(sim.behavior.cycle_mode, 2);
+        // Novae ship on: a threshold this far above uniform density only fires on
+        // a genuinely tight knot, so ordinary clustering is unaffected.
+        assert!(sim.behavior.nova_enabled);
+        assert!(sim.behavior.nova_threshold > 1.0);
+        assert!((0.0..=1.0).contains(&sim.behavior.nova_radius));
+        assert!(sim.behavior.nova_duration > 0.0);
         sim.randomize_matrix(RuleKind::Distance);
         assert!(sim.distance.iter().all(|v| (0.25..=0.8).contains(v)));
         sim.set_rule(RuleKind::Distance, 0, -1.0);
@@ -572,17 +517,6 @@ mod tests {
         for (n, t) in [(0, 8), (1, 0), (u32::MAX, 8), (100_000, u32::MAX)] {
             assert!(validate_counts(n, t, &s).is_err());
         }
-    }
-    #[test]
-    fn evolution_defaults_are_sane_and_revision_bumps() {
-        let mut s = Simulation::default();
-        assert!(s.evolution.enabled);
-        assert_eq!(s.evolution.mutation, 0.12);
-        assert_eq!(s.evolution.cull_free_fraction, 0.02);
-        assert_eq!(s.evolution.influence, 1.0);
-        let revision = s.evolution.evolution_revision;
-        s.evolution.evolution_revision += 1;
-        assert_ne!(s.evolution.evolution_revision, revision);
     }
     #[test]
     fn extended_palettes_are_finite() {

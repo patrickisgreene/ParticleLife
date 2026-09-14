@@ -1,3 +1,4 @@
+use crate::interaction::*;
 use crate::model::*;
 use bevy::scene::prelude::*;
 use bevy::text::{EditableText, FontSourceTemplate, TextEditChange};
@@ -14,7 +15,10 @@ use bevy::{
     },
     input::keyboard::KeyboardInput,
     input::mouse::{AccumulatedMouseMotion, MouseScrollUnit, MouseWheel},
-    input_focus::{FocusCause, FocusedInput, InputFocus, tab_navigation::TabGroup},
+    input_focus::{
+        FocusCause, FocusedInput, InputFocus,
+        tab_navigation::{TabGroup, TabIndex},
+    },
     picking::hover::HoverMap,
     prelude::*,
     ui::{Checked, InteractionDisabled},
@@ -30,41 +34,58 @@ impl Plugin for ControlsPlugin {
         app.add_plugins(FeathersPlugins)
             .insert_resource(UiTheme(create_dark_theme()))
             .init_resource::<Controls>()
+            .init_resource::<InteractionTools>()
             .add_systems(Startup, setup)
-            .add_systems(Update, (input, sync, matrix).chain().in_set(UiSet))
+            .add_systems(
+                Update,
+                (input, update_dumps, sync, matrix, sync_tools)
+                    .chain()
+                    .in_set(UiSet),
+            )
             .add_observer(activate)
             .add_observer(float_change)
+            .add_observer(brush_change)
             .add_observer(integer_change)
             .add_observer(bool_change)
             .add_observer(scroll)
-            .add_observer(validate_integer_text);
+            .add_observer(validate_integer_text)
+            .add_observer(section_change)
+            .add_systems(Update, sync_hidden_focus.after(UiSet))
+            .add_systems(
+                PostUpdate,
+                compact_fonts
+                    .after(bevy::ui::UiSystems::Propagate)
+                    .before(bevy::ui::UiSystems::Content),
+            );
     }
 }
 #[derive(Resource)]
 pub struct Controls {
     count: u32,
     types: u32,
-    selected: (u32, u32),
-    rule_kind: RuleKind,
+    selected: [(u32, u32); 4],
     pub visible: bool,
-    tab: usize,
     error: String,
     fps: f32,
     dragging: bool,
+    pointer_start: Option<Vec2>,
+    pointer_moved: bool,
+    brushing: bool,
     invalid: [bool; 3],
 }
 impl Default for Controls {
     fn default() -> Self {
         Self {
-            count: 50_000,
+            count: 100_000,
             types: 8,
-            selected: (0, 0),
-            rule_kind: RuleKind::Attraction,
+            selected: [(0, 0); 4],
             visible: true,
-            tab: 0,
             error: String::new(),
             fps: 60.,
             dragging: false,
+            pointer_start: None,
+            pointer_moved: false,
+            brushing: false,
             invalid: [false; 3],
         }
     }
@@ -86,11 +107,9 @@ struct BackgroundFocus;
 struct Sidebar;
 #[derive(Component)]
 struct ShowButton;
-#[derive(Component)]
-struct TabBody(usize);
 #[derive(Component, Clone, Copy)]
 enum Action {
-    Tab(usize),
+    Tool(Tool),
     Hide,
     Show,
     Play,
@@ -99,15 +118,12 @@ enum Action {
     Apply,
     ResetView,
     ClearTrails,
-    Randomize,
-    Zero,
-    Universe,
-    ResetGenomes,
-    Kind(RuleKind),
+    Randomize(RuleKind),
+    Zero(RuleKind),
     Palette(usize),
     Cycle(u32),
     Exact(bool),
-    Cell(u32, u32),
+    Cell(RuleKind, u32, u32),
 }
 #[derive(Component, Clone, Copy)]
 enum Integer {
@@ -120,9 +136,8 @@ enum Toggle {
     Clustered,
     Preferred,
     Density,
+    Nova,
     Trails,
-    Detection,
-    Evolution,
 }
 #[derive(Component, Clone, Copy)]
 enum Info {
@@ -131,9 +146,9 @@ enum Info {
     Message,
     Error,
     Active,
-    Rule,
-    Selection,
-    Hover,
+    Rule(RuleKind),
+    Selection(RuleKind),
+    Hover(RuleKind),
     Palette,
     Cycle,
     Exact,
@@ -141,25 +156,24 @@ enum Info {
 #[derive(Component)]
 struct Swatch(u32);
 #[derive(Component)]
-struct MatrixViewport;
+struct MatrixViewport(RuleKind);
 #[derive(Component)]
-struct MatrixContent;
+struct MatrixContent(RuleKind);
 #[derive(Component)]
-struct MatrixCell(u32, u32);
+struct MatrixCell(RuleKind, u32, u32);
 #[derive(Component, Clone, Copy)]
 enum Gate {
     Density,
+    Nova,
     Cycle,
     Neighbors,
     Trails,
     Step,
-    Detection,
-    Evolution,
 }
 
 fn text(commands: &mut Commands, parent: Entity, value: impl Into<String>) -> Entity {
     let value = value.into();
-    commands.spawn_scene(bsn! { Text(value) ThemedText TextFont { font: FontSourceTemplate::Handle(fonts::REGULAR), font_size: bevy::text::FontSize::Px(13.0) } }).insert(ChildOf(parent)).id()
+    commands.spawn_scene(bsn! { Text(value) ThemedText TextFont { font: FontSourceTemplate::Handle(fonts::REGULAR), font_size: bevy::text::FontSize::Px(11.0) } }).insert(ChildOf(parent)).id()
 }
 fn info(commands: &mut Commands, parent: Entity, kind: Info) {
     let id = text(commands, parent, "");
@@ -204,7 +218,76 @@ fn button(
     }
     entity.id()
 }
-fn sub(commands: &mut Commands, parent: Entity, title: &'static str) -> Entity {
+#[derive(Component)]
+struct SectionBody;
+#[derive(Component)]
+struct SectionToggle(Entity);
+#[derive(Component)]
+struct HiddenTabIndex(i32);
+
+// Feathers has font overrides inside controls as well as on containers.
+fn compact_fonts(mut fonts: Query<&mut TextFont, Changed<TextFont>>) {
+    for mut font in &mut fonts {
+        if font.font_size != bevy::text::FontSize::Px(11.0) {
+            font.font_size = bevy::text::FontSize::Px(11.0);
+        }
+    }
+}
+
+fn section_change(
+    event: On<ValueChange<bool>>,
+    toggles: Query<&SectionToggle>,
+    mut bodies: Query<&mut Node, With<SectionBody>>,
+    mut commands: Commands,
+    parents: Query<&ChildOf>,
+    mut focus: ResMut<InputFocus>,
+) {
+    let Ok(toggle) = toggles.get(event.source) else {
+        return;
+    };
+    let Ok(mut body) = bodies.get_mut(toggle.0) else {
+        return;
+    };
+    body.display = if event.value {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    if event.value {
+        commands.entity(event.source).insert(Checked);
+    } else {
+        commands.entity(event.source).remove::<Checked>();
+        if focus
+            .get()
+            .is_some_and(|entity| parents.iter_ancestors(entity).any(|e| e == toggle.0))
+        {
+            focus.set(event.source, FocusCause::Navigated);
+        }
+    }
+}
+
+// Bevy tab navigation does not filter Display::None ancestors itself.
+fn sync_hidden_focus(
+    mut commands: Commands,
+    parents: Query<&ChildOf>,
+    nodes: Query<&Node>,
+    mut indices: Query<(Entity, &mut TabIndex, Option<&HiddenTabIndex>)>,
+) {
+    for (entity, mut index, saved) in &mut indices {
+        let hidden = std::iter::once(entity)
+            .chain(parents.iter_ancestors(entity))
+            .any(|e| nodes.get(e).is_ok_and(|n| n.display == Display::None));
+        if hidden && saved.is_none() {
+            commands.entity(entity).insert(HiddenTabIndex(index.0));
+            index.0 = -1;
+        } else if !hidden && let Some(saved) = saved {
+            index.0 = saved.0;
+            commands.entity(entity).remove::<HiddenTabIndex>();
+        }
+    }
+}
+
+fn sub(commands: &mut Commands, parent: Entity, title: &'static str, expanded: bool) -> Entity {
     let root = commands
         .spawn_scene(subpane())
         .insert((
@@ -220,11 +303,88 @@ fn sub(commands: &mut Commands, parent: Entity, title: &'static str) -> Entity {
         .spawn_scene(subpane_header())
         .insert(ChildOf(root))
         .id();
-    text(commands, header, title);
     commands
+        .entity(header)
+        .entry::<Node>()
+        .and_modify(|mut node| {
+            node.min_height = px(24);
+            node.justify_content = JustifyContent::Start;
+        });
+    let toggle = commands
+        .spawn_scene(bsn! { @FeathersDisclosureToggle })
+        .insert(ChildOf(header))
+        .id();
+    text(commands, header, title);
+    let body = commands
         .spawn_scene(subpane_body())
-        .insert(ChildOf(root))
-        .id()
+        .insert((ChildOf(root), SectionBody))
+        .id();
+    commands
+        .entity(body)
+        .entry::<Node>()
+        .and_modify(move |mut node| {
+            node.display = if expanded {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        });
+    commands.entity(toggle).insert(SectionToggle(body));
+    if expanded {
+        commands.entity(toggle).insert(Checked);
+    }
+    commands.entity(header).observe(
+        move |event: On<Pointer<Click>>,
+              parents: Query<&ChildOf>,
+              checked: Query<Has<Checked>>,
+              mut commands: Commands| {
+            // The native toggle handles its own clicks; the rest of the header forwards activation.
+            if event.entity != toggle && !parents.iter_ancestors(event.entity).any(|e| e == toggle)
+            {
+                commands.trigger(ValueChange {
+                    source: toggle,
+                    value: !checked.get(toggle).unwrap_or(false),
+                    is_final: true,
+                });
+            }
+        },
+    );
+    body
+}
+
+fn control_row(commands: &mut Commands, parent: Entity, caption: &'static str) -> Entity {
+    let row = commands
+        .spawn((
+            Node {
+                width: percent(100),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px(6),
+                flex_shrink: 0.,
+                ..default()
+            },
+            ChildOf(parent),
+        ))
+        .id();
+    let label = text(commands, row, caption);
+    commands.entity(label).insert(Node {
+        width: percent(45),
+        min_width: px(0),
+        flex_shrink: 0.,
+        ..default()
+    });
+    let slot = commands
+        .spawn((
+            Node {
+                flex_grow: 1.,
+                flex_basis: px(0),
+                min_width: px(0),
+                ..default()
+            },
+            ChildOf(row),
+        ))
+        .id();
+    slot
 }
 fn check(commands: &mut Commands, parent: Entity, caption: &'static str, kind: Toggle) {
     commands
@@ -232,20 +392,20 @@ fn check(commands: &mut Commands, parent: Entity, caption: &'static str, kind: T
         .insert((ChildOf(parent), kind));
 }
 fn integer(commands: &mut Commands, parent: Entity, caption: &'static str, kind: Integer) {
-    text(commands, parent, caption);
+    let parent = control_row(commands, parent, caption);
     commands
-        .spawn_scene(bsn! { @FeathersNumberInput { @number_format: NumberFormat::I64 } })
+        .spawn_scene(bsn! { @FeathersNumberInput { @number_format: NumberFormat::I64 } Node { width: percent(100), min_width: px(0) } })
         .insert((ChildOf(parent), kind));
 }
 fn slider(commands: &mut Commands, parent: Entity, field: Field) -> Entity {
-    text(commands, parent, field.label());
-    let (min, max) = field.range(RuleKind::Attraction);
+    let parent = control_row(commands, parent, field.label());
+    let (min, max) = field.range();
     let id = commands
-        .spawn_scene(bsn! { @FeathersSlider { @min: min, @max: max } Node { flex_grow: 0.0, flex_shrink: 0.0 } })
+        .spawn_scene(bsn! { @FeathersSlider { @min: min, @max: max } Node { width: percent(100), min_width: px(0), flex_grow: 1.0 } })
         .insert((
             ChildOf(parent),
             field,
-            SliderPrecision(if matches!(field, Field::Rule) {
+            SliderPrecision(if matches!(field, Field::Rule(_)) {
                 3
             } else if matches!(field, Field::CycleMin) {
                 0
@@ -260,8 +420,17 @@ fn slider(commands: &mut Commands, parent: Entity, field: Field) -> Entity {
     id
 }
 fn menu(commands: &mut Commands, parent: Entity, kind: Info, choices: Vec<(&'static str, Action)>) {
+    let parent = control_row(
+        commands,
+        parent,
+        if matches!(kind, Info::Palette) {
+            "Palette"
+        } else {
+            "Type cycle"
+        },
+    );
     let root = commands
-        .spawn_scene(bsn! { @FeathersMenu })
+        .spawn_scene(bsn! { @FeathersMenu Node { width: percent(100), min_width: px(0) } })
         .insert(ChildOf(parent))
         .id();
     let label = commands
@@ -279,10 +448,148 @@ fn menu(commands: &mut Commands, parent: Entity, kind: Info, choices: Vec<(&'sta
             .insert((ChildOf(popup), action));
     }
 }
+#[derive(Component, Clone, Copy)]
+enum BrushControl {
+    Radius,
+    Strength,
+    Rate,
+}
+#[derive(Component)]
+struct BrushSettings;
+#[derive(Component)]
+struct ToolHint;
+
+fn brush_change(
+    event: On<ValueChange<f32>>,
+    fields: Query<&BrushControl>,
+    mut tools: ResMut<InteractionTools>,
+) {
+    if !event.value.is_finite() {
+        return;
+    }
+    match fields.get(event.source) {
+        Ok(BrushControl::Radius) => tools.radius = event.value.clamp(8., 512.),
+        Ok(BrushControl::Strength) => tools.strength = event.value.clamp(0., 5000.),
+        Ok(BrushControl::Rate) => tools.rate = event.value.clamp(100., 20000.),
+        _ => (),
+    }
+}
+fn update_dumps(
+    time: Res<Time>,
+    status: Res<Status>,
+    mut tools: ResMut<InteractionTools>,
+    mut sim: ResMut<Simulation>,
+    mut controls: ResMut<Controls>,
+    mut remainder: Local<f32>,
+) {
+    if tools.epoch != sim.epoch {
+        tools.pending.clear();
+        tools.epoch = sim.epoch;
+        tools.active = false;
+        tools.error.clear();
+        *remainder = 0.;
+    }
+    let report = status.0.lock().unwrap();
+    if report.dump_ack.0 == sim.epoch {
+        tools
+            .pending
+            .retain(|batch| batch.serial > report.dump_ack.1);
+    }
+    if tools.tool != Tool::Dump || !tools.active {
+        *remainder = 0.;
+        return;
+    }
+    let Some(center) = tools.cursor else {
+        return;
+    };
+    if tools.pending.len() >= 120 {
+        tools.error = "Waiting for the GPU to catch up.".into();
+        return;
+    }
+    *remainder += tools.rate * time.delta_secs().min(0.1);
+    let count = remainder.floor() as u32;
+    if count == 0 {
+        return;
+    }
+    *remainder -= count as f32;
+    let Some(next) = sim.count.checked_add(count) else {
+        tools.error = "Particle count limit reached.".into();
+        return;
+    };
+    if let Err(error) = validate_counts(next, sim.types, &report) {
+        tools.error = error;
+        return;
+    }
+    tools.error.clear();
+    tools.serial += 1;
+    let batch = ParticleDump {
+        serial: tools.serial,
+        start: sim.count,
+        count,
+        center,
+        radius: tools.radius,
+    };
+    tools.pending.push(batch);
+    sim.count = next;
+    controls.count = next;
+}
+fn sync_tools(
+    mut commands: Commands,
+    tools: Res<InteractionTools>,
+    mut actions: Query<(&Action, &mut ButtonVariant)>,
+    mut panels: Query<&mut Node, With<BrushSettings>>,
+    sliders: Query<(Entity, &BrushControl, &SliderValue)>,
+    mut labels: Query<&mut Text, With<ToolHint>>,
+) {
+    for (action, mut variant) in &mut actions {
+        let Action::Tool(tool) = action else { continue };
+        let next = if tools.tool == *tool {
+            ButtonVariant::Primary
+        } else {
+            ButtonVariant::Normal
+        };
+        if *variant != next {
+            *variant = next;
+        }
+    }
+    for mut node in &mut panels {
+        node.display = if tools.tool != Tool::Navigate {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+    for (entity, field, value) in &sliders {
+        let next = match field {
+            BrushControl::Radius => tools.radius,
+            BrushControl::Strength => tools.strength,
+            BrushControl::Rate => tools.rate,
+        };
+        if value.0 != next {
+            commands.entity(entity).insert(SliderValue(next));
+        }
+    }
+    for mut text in &mut labels {
+        let hint = match tools.tool {
+            Tool::Navigate => "Drag to pan · wheel to zoom · middle drag works with every tool",
+            Tool::Attract => "Hold left to attract · Shift + wheel changes radius",
+            Tool::Repel => "Hold left to repel · Shift + wheel changes radius",
+            Tool::Dump => "Hold left to add particles · mixed types · Shift + wheel changes radius",
+        };
+        let next = if tools.error.is_empty() {
+            hint.to_string()
+        } else {
+            format!("{hint}\n{}", tools.error)
+        };
+        if text.0 != next {
+            text.0 = next;
+        }
+    }
+}
 fn setup(mut commands: Commands, mut focus: ResMut<InputFocus>) {
     let background = commands.spawn(BackgroundFocus).observe(shortcut).id();
     focus.set(background, FocusCause::Navigated);
-    let root=commands.spawn_scene(bsn! { pane() InheritableFont { font: fonts::REGULAR, font_size: bevy::text::FontSize::Px(13.0) } }).insert((Sidebar, TabGroup::default(), Node {
+    let root=commands.spawn_scene(bsn! { pane() InheritableFont { font: fonts::REGULAR, font_size: bevy::text::FontSize::Px(11.0) } }).insert((Sidebar, TabGroup::default(), Node {
         position_type: PositionType::Absolute, left:px(0), top:px(0), width:px(360), height:percent(100),
         flex_direction:FlexDirection::Column, padding:UiRect::all(px(6)), row_gap:px(5), overflow:Overflow::clip(), ..default()
     }, BackgroundColor(Color::srgb(0.035,0.04,0.05)))).id();
@@ -341,62 +648,74 @@ fn setup(mut commands: Commands, mut focus: ResMut<InputFocus>) {
         RoundedCorners::Right,
     );
     info(&mut commands, root, Info::Exact);
-    let tabs = row(&mut commands, root);
-    for (i, (name, corners)) in [
-        ("World", RoundedCorners::Left),
-        ("Appearance", RoundedCorners::None),
-        ("Rules", RoundedCorners::Right),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let id = button(&mut commands, tabs, name, Action::Tab(i), corners);
-        commands.entity(id).insert(Node {
-            flex_grow: 1.,
-            height: px(28),
-            align_items: AlignItems::Center,
-            justify_content: JustifyContent::Center,
-            border_radius: corners.to_border_radius(4.),
-            ..default()
-        });
+    let tools = row(&mut commands, root);
+    for (label, tool) in [
+        ("Pan", Tool::Navigate),
+        ("Attract", Tool::Attract),
+        ("Repel", Tool::Repel),
+        ("Dump", Tool::Dump),
+    ] {
+        button(
+            &mut commands,
+            tools,
+            label,
+            Action::Tool(tool),
+            RoundedCorners::All,
+        );
     }
-    let mut bodies = Vec::new();
-    for tab in 0..3 {
-        let frame = commands
-            .spawn((
-                ChildOf(root),
-                TabBody(tab),
-                Node {
-                    flex_direction: FlexDirection::Row,
-                    flex_grow: 1.,
-                    flex_basis: px(0),
-                    min_height: px(0),
-                    column_gap: px(3),
-                    ..default()
-                },
-            ))
-            .id();
-        let body = commands
-            .spawn_scene(pane_body())
-            .insert((
-                ChildOf(frame),
-                ScrollPosition::default(),
-                Node {
-                    flex_direction: FlexDirection::Column,
-                    flex_grow: 1.,
-                    min_width: px(0),
-                    min_height: px(0),
-                    row_gap: px(8),
-                    padding: UiRect::all(px(4)),
-                    overflow: Overflow::scroll_y(),
-                    ..default()
-                },
-            ))
-            .id();
-        scrollbar(&mut commands, frame, body, true);
-        bodies.push(body);
+    let hint = text(&mut commands, root, "");
+    commands.entity(hint).insert(ToolHint);
+    let brush = commands
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: px(4),
+                ..default()
+            },
+            BrushSettings,
+            ChildOf(root),
+        ))
+        .id();
+    for (caption, field, min, max) in [
+        ("Brush radius", BrushControl::Radius, 8_f32, 512_f32),
+        ("Brush strength", BrushControl::Strength, 0_f32, 5000_f32),
+        ("Particles / second", BrushControl::Rate, 100_f32, 20000_f32),
+    ] {
+        let slot = control_row(&mut commands, brush, caption);
+        commands.spawn_scene(bsn! { @FeathersSlider { @min: min, @max: max } Node { width: percent(100), min_width: px(0) } }).insert((ChildOf(slot), field, SliderPrecision(0)));
     }
-    let world = sub(&mut commands, bodies[0], "World & particle types");
+    let frame = commands
+        .spawn((
+            ChildOf(root),
+            Node {
+                flex_direction: FlexDirection::Row,
+                flex_grow: 1.,
+                flex_basis: px(0),
+                min_height: px(0),
+                column_gap: px(3),
+                ..default()
+            },
+        ))
+        .id();
+    let body = commands
+        .spawn_scene(pane_body())
+        .insert((
+            ChildOf(frame),
+            ScrollPosition::default(),
+            Node {
+                flex_direction: FlexDirection::Column,
+                flex_grow: 1.,
+                min_width: px(0),
+                min_height: px(0),
+                row_gap: px(8),
+                padding: UiRect::all(px(4)),
+                overflow: Overflow::scroll_y(),
+                ..default()
+            },
+        ))
+        .id();
+    scrollbar(&mut commands, frame, body, true);
+    let world = sub(&mut commands, body, "World & particle types", true);
     integer(&mut commands, world, "Particles", Integer::Count);
     integer(&mut commands, world, "Types", Integer::Types);
     integer(&mut commands, world, "Seed", Integer::Seed);
@@ -420,7 +739,7 @@ fn setup(mut commands: Commands, mut focus: ResMut<InputFocus>) {
         world,
         "Count changes regenerate interaction rules. Seed and clustering apply on reset.",
     );
-    let motion = sub(&mut commands, bodies[0], "Motion");
+    let motion = sub(&mut commands, body, "Motion", false);
     for f in [
         Field::Radius,
         Field::Strength,
@@ -429,7 +748,7 @@ fn setup(mut commands: Commands, mut focus: ResMut<InputFocus>) {
     ] {
         slider(&mut commands, motion, f);
     }
-    let color = sub(&mut commands, bodies[1], "Color & light");
+    let color = sub(&mut commands, body, "Color & light", false);
     menu(
         &mut commands,
         color,
@@ -463,45 +782,7 @@ fn setup(mut commands: Commands, mut focus: ResMut<InputFocus>) {
         Action::ResetView,
         RoundedCorners::All,
     );
-    let detection = sub(&mut commands, bodies[1], "Creatures");
-    check(
-        &mut commands,
-        detection,
-        "Detect and outline creatures",
-        Toggle::Detection,
-    );
-    text(
-        &mut commands,
-        detection,
-        "Groups particles the rules hold together into bodies and draws an outline around each one. Bond distance and body size are inferred from the interaction rules, not set here. A body holds its inferred minimum in every type it contains (floored at four), so a few stray particles of one kind inside another don't count. Labels take a few steps to settle, so outlines trail sudden changes.",
-    );
-    for f in [Field::PromoteSteps, Field::OutlineVisibility] {
-        slider(&mut commands, detection, f);
-    }
-    let evolution = sub(&mut commands, bodies[1], "Evolution");
-    check(
-        &mut commands,
-        evolution,
-        "Adaptive bodies",
-        Toggle::Evolution,
-    );
-    text(
-        &mut commands,
-        evolution,
-        "Each body carries an anisotropic kernel per interaction kind. Its measured shape steers how it feels its own kind, and a tracked body that splits apart leaves a child inheriting mutated genes. When free particles run short the least durable body is scattered back into free material.",
-    );
-    for f in [Field::Mutation, Field::CullFree, Field::Influence] {
-        slider(&mut commands, evolution, f);
-    }
-    let reset_genomes = button(
-        &mut commands,
-        evolution,
-        "Reset genomes",
-        Action::ResetGenomes,
-        RoundedCorners::All,
-    );
-    commands.entity(reset_genomes).insert(Gate::Evolution);
-    let trails = sub(&mut commands, bodies[1], "Chemical trails");
+    let trails = sub(&mut commands, body, "Chemical trails", false);
     check(
         &mut commands,
         trails,
@@ -536,7 +817,7 @@ fn setup(mut commands: Commands, mut focus: ResMut<InputFocus>) {
         trails,
         "Trails wrap with the world and pause with the simulation. Reset clears them.",
     );
-    let behavior = sub(&mut commands, bodies[2], "Spacing, density & type cycles");
+    let behavior = sub(&mut commands, body, "Spacing, density & type cycles", false);
     check(
         &mut commands,
         behavior,
@@ -579,85 +860,123 @@ fn setup(mut commands: Commands, mut focus: ResMut<InputFocus>) {
         behavior,
         "Types advance 1 → 2 → … → 1. Either allows neighbor changes after 0.5 s; the timer sets the maximum wait.",
     );
-    let rules = sub(&mut commands, bodies[2], "Interaction rules");
-    for (name, action) in [
-        ("Randomize selected", Action::Randomize),
-        ("Zero selected", Action::Zero),
-        ("New universe (all rules)", Action::Universe),
+    let nova = sub(&mut commands, body, "Stars & novae", false);
+    check(
+        &mut commands,
+        nova,
+        "Ignite dense same-type clumps",
+        Toggle::Nova,
+    );
+    for f in [
+        Field::NovaThreshold,
+        Field::NovaRadius,
+        Field::NovaImpulse,
+        Field::NovaDuration,
     ] {
-        button(&mut commands, rules, name, action, RoundedCorners::All);
-    }
-    let kinds = row(&mut commands, rules);
-    for kind in RuleKind::ALL {
-        button(
-            &mut commands,
-            kinds,
-            kind.label(),
-            Action::Kind(kind),
-            RoundedCorners::All,
-        );
+        slider(&mut commands, nova, f);
     }
     text(
         &mut commands,
-        rules,
-        "Row feels column: blue is positive, coral is negative. Shift + scroll moves horizontally.",
+        nova,
+        "Too many particles of one type inside the ignition radius blow apart. The core is reseeded at random across the world; fast mode estimates the count, so exact mode ignites more precisely.",
     );
-    info(&mut commands, rules, Info::Rule);
-    let frame = commands
-        .spawn((
-            ChildOf(rules),
+    for kind in RuleKind::ALL {
+        let rules = sub(&mut commands, body, kind.label(), false);
+        text(
+            &mut commands,
+            rules,
+            match kind {
+                RuleKind::Attraction => {
+                    "Pulls particles together or pushes them apart. Positive attracts; negative repels. Very close particles always repel."
+                }
+                RuleKind::Swirl => {
+                    "Adds sideways motion around neighboring particles. Positive turns counterclockwise; negative turns clockwise."
+                }
+                RuleKind::Alignment => {
+                    "Steers particles toward their neighbors’ velocity. Positive matches their motion; negative steers against it."
+                }
+                RuleKind::Distance => {
+                    "Sets a preferred separation as a fraction of the interaction radius. Enable Preferred pair distances above to use it. Nonzero values replace radial attraction for that pair; zero keeps the attraction rule."
+                }
+            },
+        );
+        let actions = row(&mut commands, rules);
+        button(
+            &mut commands,
+            actions,
+            "Randomize",
+            Action::Randomize(kind),
+            RoundedCorners::All,
+        );
+        button(
+            &mut commands,
+            actions,
+            "Zero",
+            Action::Zero(kind),
+            RoundedCorners::All,
+        );
+        text(
+            &mut commands,
+            rules,
+            "Row feels column. Select a cell to edit that pair. Shift + scroll moves horizontally.",
+        );
+        info(&mut commands, rules, Info::Rule(kind));
+        let frame = commands
+            .spawn((
+                ChildOf(rules),
+                Node {
+                    display: Display::Grid,
+                    height: px(232),
+                    min_height: px(232),
+                    flex_shrink: 0.,
+                    grid_template_columns: vec![
+                        RepeatedGridTrack::flex(1, 1.),
+                        RepeatedGridTrack::px(1, 8.),
+                    ],
+                    grid_template_rows: vec![
+                        RepeatedGridTrack::flex(1, 1.),
+                        RepeatedGridTrack::px(1, 8.),
+                    ],
+                    column_gap: px(2),
+                    row_gap: px(2),
+                    ..default()
+                },
+            ))
+            .id();
+        let view = commands
+            .spawn((
+                MatrixViewport(kind),
+                ScrollPosition::default(),
+                Node {
+                    min_width: px(0),
+                    min_height: px(0),
+                    overflow: Overflow::scroll(),
+                    grid_row: GridPlacement::start(1),
+                    grid_column: GridPlacement::start(1),
+                    ..default()
+                },
+                ChildOf(frame),
+            ))
+            .id();
+        scrollbar(&mut commands, frame, view, true);
+        scrollbar(&mut commands, frame, view, false);
+        commands.spawn((
+            MatrixContent(kind),
             Node {
-                display: Display::Grid,
-                height: px(232),
-                min_height: px(232),
+                position_type: PositionType::Relative,
                 flex_shrink: 0.,
-                grid_template_columns: vec![
-                    RepeatedGridTrack::flex(1, 1.),
-                    RepeatedGridTrack::px(1, 8.),
-                ],
-                grid_template_rows: vec![
-                    RepeatedGridTrack::flex(1, 1.),
-                    RepeatedGridTrack::px(1, 8.),
-                ],
-                column_gap: px(2),
-                row_gap: px(2),
                 ..default()
             },
-        ))
-        .id();
-    let view = commands
-        .spawn((
-            MatrixViewport,
-            ScrollPosition::default(),
-            Node {
-                min_width: px(0),
-                min_height: px(0),
-                overflow: Overflow::scroll(),
-                grid_row: GridPlacement::start(1),
-                grid_column: GridPlacement::start(1),
-                ..default()
-            },
-            ChildOf(frame),
-        ))
-        .id();
-    scrollbar(&mut commands, frame, view, true);
-    scrollbar(&mut commands, frame, view, false);
-    commands.spawn((
-        MatrixContent,
-        Node {
-            position_type: PositionType::Relative,
-            flex_shrink: 0.,
-            ..default()
-        },
-        ChildOf(view),
-    ));
-    info(&mut commands, rules, Info::Hover);
-    info(&mut commands, rules, Info::Selection);
-    slider(&mut commands, rules, Field::Rule);
+            ChildOf(view),
+        ));
+        info(&mut commands, rules, Info::Hover(kind));
+        info(&mut commands, rules, Info::Selection(kind));
+        slider(&mut commands, rules, Field::Rule(kind));
+    }
     text(
         &mut commands,
         root,
-        "Background: scroll to zoom · drag to pan\nSpace pause · → step · R reset · F11 fullscreen\nTab: hide/show on background; navigate in controls",
+        "Background: wheel zoom · middle drag pan\nSpace pause · → step · R reset · F11 fullscreen\nTab: hide/show on background; navigate in controls",
     );
     let show = button(
         &mut commands,
@@ -680,7 +999,7 @@ fn setup(mut commands: Commands, mut focus: ResMut<InputFocus>) {
     ));
 }
 
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone, Copy, PartialEq)]
 enum Field {
     Speed,
     Radius,
@@ -690,9 +1009,11 @@ enum Field {
     Glow,
     DensityTarget,
     DensityStrength,
+    NovaThreshold,
+    NovaRadius,
+    NovaImpulse,
+    NovaDuration,
     SampleBudget,
-    PromoteSteps,
-    OutlineVisibility,
     CycleSeconds,
     CycleFraction,
     CycleMin,
@@ -702,10 +1023,7 @@ enum Field {
     Diffusion,
     Sensor,
     Visibility,
-    Mutation,
-    CullFree,
-    Influence,
-    Rule,
+    Rule(RuleKind),
 }
 impl Field {
     fn label(self) -> &'static str {
@@ -718,9 +1036,11 @@ impl Field {
             Self::Glow => "Glow",
             Self::DensityTarget => "Target neighbors",
             Self::DensityStrength => "Crowding strength",
+            Self::NovaThreshold => "Ignition threshold",
+            Self::NovaRadius => "Ignition radius",
+            Self::NovaImpulse => "Blast strength",
+            Self::NovaDuration => "Blast duration (s)",
             Self::SampleBudget => "Sample budget",
-            Self::PromoteSteps => "Steps before tracking",
-            Self::OutlineVisibility => "Outline visibility",
             Self::CycleSeconds => "Interval / cooldown (s)",
             Self::CycleFraction => "Next-type fraction",
             Self::CycleMin => "Minimum neighbors",
@@ -730,13 +1050,10 @@ impl Field {
             Self::Diffusion => "Diffusion",
             Self::Sensor => "Sensing distance",
             Self::Visibility => "Trail visibility",
-            Self::Mutation => "Mutation rate",
-            Self::CullFree => "Cull free fraction",
-            Self::Influence => "Genome influence",
-            Self::Rule => "Selected rule value",
+            Self::Rule(_) => "Selected rule value",
         }
     }
-    fn range(self, kind: RuleKind) -> (f32, f32) {
+    fn range(self) -> (f32, f32) {
         match self {
             Self::Speed => (0.1, 3.0),
             Self::Radius => (8.0, 128.0),
@@ -746,9 +1063,11 @@ impl Field {
             Self::Glow => (0.0, 1.0),
             Self::DensityTarget => (1.0, 512.0),
             Self::DensityStrength => (0.0, 2.0),
+            Self::NovaThreshold => (4.0, 256.0),
+            Self::NovaRadius => (0.05, 1.0),
+            Self::NovaImpulse => (200.0, 6000.0),
+            Self::NovaDuration => (0.05, 1.0),
             Self::SampleBudget => (16.0, 256.0),
-            Self::PromoteSteps => (1.0, 240.0),
-            Self::OutlineVisibility => (0.0, 2.0),
             Self::CycleSeconds => (0.5, 30.0),
             Self::CycleFraction => (0.05, 1.0),
             Self::CycleMin => (1.0, 128.0),
@@ -758,10 +1077,7 @@ impl Field {
             Self::Diffusion => (0.0, 30.0),
             Self::Sensor => (4.0, 96.0),
             Self::Visibility => (0.0, 1.0),
-            Self::Mutation => (0.0, 0.5),
-            Self::CullFree => (0.0, 0.25),
-            Self::Influence => (0.0, 2.0),
-            Self::Rule => {
+            Self::Rule(kind) => {
                 if kind == RuleKind::Distance {
                     (0., 0.95)
                 } else {
@@ -774,6 +1090,8 @@ impl Field {
         match self {
             Self::DensityTarget => Some(Gate::Density),
             Self::DensityStrength => Some(Gate::Density),
+            Self::NovaThreshold | Self::NovaRadius => Some(Gate::Nova),
+            Self::NovaImpulse | Self::NovaDuration => Some(Gate::Nova),
             Self::CycleSeconds => Some(Gate::Cycle),
             Self::CycleFraction => Some(Gate::Neighbors),
             Self::CycleMin => Some(Gate::Neighbors),
@@ -783,11 +1101,6 @@ impl Field {
             Self::Diffusion => Some(Gate::Trails),
             Self::Sensor => Some(Gate::Trails),
             Self::Visibility => Some(Gate::Trails),
-            Self::PromoteSteps => Some(Gate::Detection),
-            Self::OutlineVisibility => Some(Gate::Detection),
-            Self::Mutation => Some(Gate::Evolution),
-            Self::CullFree => Some(Gate::Evolution),
-            Self::Influence => Some(Gate::Evolution),
             _ => None,
         }
     }
@@ -801,9 +1114,11 @@ impl Field {
             Self::Glow => a.glow,
             Self::DensityTarget => s.behavior.density_target,
             Self::DensityStrength => s.behavior.density_strength,
+            Self::NovaThreshold => s.behavior.nova_threshold,
+            Self::NovaRadius => s.behavior.nova_radius,
+            Self::NovaImpulse => s.behavior.nova_impulse,
+            Self::NovaDuration => s.behavior.nova_duration,
             Self::SampleBudget => s.behavior.sample_budget as f32,
-            Self::PromoteSteps => s.detection.promote_steps as f32,
-            Self::OutlineVisibility => s.detection.outline,
             Self::CycleSeconds => s.behavior.cycle_seconds,
             Self::CycleFraction => s.behavior.cycle_fraction,
             Self::CycleMin => s.behavior.cycle_min_neighbors as f32,
@@ -813,14 +1128,14 @@ impl Field {
             Self::Diffusion => s.trails.diffusion,
             Self::Sensor => s.trails.sensor_distance,
             Self::Visibility => s.trails.visibility,
-            Self::Mutation => s.evolution.mutation,
-            Self::CullFree => s.evolution.cull_free_fraction,
-            Self::Influence => s.evolution.influence,
-            Self::Rule => s.matrix(c.rule_kind)[(c.selected.0 * s.types + c.selected.1) as usize],
+            Self::Rule(kind) => {
+                let (row, col) = c.selected[kind as usize];
+                s.matrix(kind)[(row * s.types + col) as usize]
+            }
         }
     }
     fn set(self, value: f32, s: &mut Simulation, a: &mut Appearance, c: &Controls) {
-        let (min, max) = self.range(c.rule_kind);
+        let (min, max) = self.range();
         let value = value.clamp(min, max);
         match self {
             Self::Speed => s.speed = value,
@@ -831,9 +1146,11 @@ impl Field {
             Self::Glow => a.glow = value,
             Self::DensityTarget => s.behavior.density_target = value,
             Self::DensityStrength => s.behavior.density_strength = value,
+            Self::NovaThreshold => s.behavior.nova_threshold = value,
+            Self::NovaRadius => s.behavior.nova_radius = value,
+            Self::NovaImpulse => s.behavior.nova_impulse = value,
+            Self::NovaDuration => s.behavior.nova_duration = value,
             Self::SampleBudget => s.behavior.sample_budget = value.round() as u32,
-            Self::PromoteSteps => s.detection.promote_steps = value.round() as u32,
-            Self::OutlineVisibility => s.detection.outline = value,
             Self::CycleSeconds => s.behavior.cycle_seconds = value,
             Self::CycleFraction => s.behavior.cycle_fraction = value,
             Self::CycleMin => s.behavior.cycle_min_neighbors = value.round() as u32,
@@ -843,25 +1160,20 @@ impl Field {
             Self::Diffusion => s.trails.diffusion = value,
             Self::Sensor => s.trails.sensor_distance = value,
             Self::Visibility => s.trails.visibility = value,
-            Self::Mutation => s.evolution.mutation = value,
-            Self::CullFree => s.evolution.cull_free_fraction = value,
-            Self::Influence => s.evolution.influence = value,
-            Self::Rule => s.set_rule(
-                c.rule_kind,
-                (c.selected.0 * s.types + c.selected.1) as usize,
-                value,
-            ),
+            Self::Rule(kind) => {
+                let (row, col) = c.selected[kind as usize];
+                s.set_rule(kind, (row * s.types + col) as usize, value);
+            }
         }
     }
 }
 fn enabled(gate: Gate, s: &Simulation) -> bool {
     match gate {
         Gate::Density => s.behavior.density_enabled,
+        Gate::Nova => s.behavior.nova_enabled,
         Gate::Cycle => s.behavior.cycle_mode != 0,
         Gate::Neighbors => s.behavior.cycle_mode >= 2,
         Gate::Trails => s.trails.enabled,
-        Gate::Detection => s.detection.enabled,
-        Gate::Evolution => s.detection.enabled && s.evolution.enabled,
         Gate::Step => s.paused,
     }
 }
@@ -872,6 +1184,7 @@ fn activate(
     mut s: ResMut<Simulation>,
     mut a: ResMut<Appearance>,
     mut c: ResMut<Controls>,
+    mut tools: ResMut<InteractionTools>,
     status: Res<Status>,
     mut focus: ResMut<InputFocus>,
     background: Single<Entity, With<BackgroundFocus>>,
@@ -883,8 +1196,11 @@ fn activate(
         return;
     }
     match *action {
-        Action::Tab(tab) => {
-            c.tab = tab;
+        Action::Tool(tool) => {
+            tools.tool = tool;
+            tools.active = false;
+            c.brushing = false;
+            c.dragging = false;
         }
         Action::Hide => {
             c.visible = false;
@@ -908,7 +1224,7 @@ fn activate(
                 s.types = c.types;
                 s.randomize();
                 s.epoch += 1;
-                c.selected = (0, 0);
+                c.selected = [(0, 0); 4];
                 c.error.clear();
             }
             Err(e) => c.error = e,
@@ -918,24 +1234,15 @@ fn activate(
             a.zoom = 1.;
         }
         Action::ClearTrails => s.trails.clear_revision += 1,
-        Action::ResetGenomes => s.evolution.evolution_revision += 1,
-        Action::Randomize => {
+        Action::Randomize(kind) => {
             s.seed = hash(s.seed);
-            s.randomize_matrix(c.rule_kind);
+            s.randomize_matrix(kind);
         }
-        Action::Zero => s.clear_matrix(c.rule_kind),
-        Action::Universe => {
-            s.seed = hash(s.seed);
-            for k in RuleKind::ALL {
-                s.randomize_matrix(k);
-            }
-            s.epoch += 1;
-        }
-        Action::Kind(k) => c.rule_kind = k,
+        Action::Zero(kind) => s.clear_matrix(kind),
         Action::Palette(i) => s.palette = i,
         Action::Cycle(i) => s.behavior.cycle_mode = i,
         Action::Exact(v) => s.exact = v,
-        Action::Cell(r, col) => c.selected = (r, col),
+        Action::Cell(kind, r, col) => c.selected[kind as usize] = (r, col),
     }
 }
 fn float_change(
@@ -988,14 +1295,13 @@ fn bool_change(event: On<ValueChange<bool>>, fields: Query<&Toggle>, mut s: ResM
         Toggle::Clustered => s.clustered = event.value,
         Toggle::Preferred => s.behavior.preferred_enabled = event.value,
         Toggle::Density => s.behavior.density_enabled = event.value,
+        Toggle::Nova => s.behavior.nova_enabled = event.value,
         Toggle::Trails => {
             if s.trails.enabled != event.value {
                 s.trails.enabled = event.value;
                 s.trails.clear_revision += 1;
             }
         }
-        Toggle::Detection => s.detection.enabled = event.value,
-        Toggle::Evolution => s.evolution.enabled = event.value,
     }
 }
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -1008,8 +1314,8 @@ fn sync(
     time: Res<Time>,
     window: Single<&Window, With<PrimaryWindow>>,
     mut nodes: Query<
-        (&mut Node, Option<&TabBody>, Has<Sidebar>, Has<ShowButton>),
-        Or<(With<TabBody>, With<Sidebar>, With<ShowButton>)>,
+        (&mut Node, Has<Sidebar>, Has<ShowButton>),
+        Or<(With<Sidebar>, With<ShowButton>)>,
     >,
     sliders: Query<(Entity, &Field, &SliderValue, &SliderRange)>,
     integers: Query<(Entity, &Integer)>,
@@ -1019,15 +1325,13 @@ fn sync(
     mut texts: Query<(&mut Text, Option<&Info>)>,
     mut swatches: Query<
         (&Swatch, &mut Node, &mut BackgroundColor),
-        (Without<TabBody>, Without<Sidebar>, Without<ShowButton>),
+        (Without<Sidebar>, Without<ShowButton>),
     >,
     mut last_integers: Local<Option<[u32; 3]>>,
 ) {
     c.fps += (1. / time.delta_secs().max(0.001) - c.fps) * 0.05;
-    for (mut node, tab, sidebar, show) in &mut nodes {
-        node.display = if if let Some(tab) = tab {
-            c.visible && c.tab == tab.0
-        } else if sidebar {
+    for (mut node, sidebar, show) in &mut nodes {
+        node.display = if if sidebar {
             c.visible
         } else {
             show && !c.visible
@@ -1047,7 +1351,7 @@ fn sync(
         if value.0 != v {
             commands.entity(entity).insert(SliderValue(v));
         }
-        let (min, max) = field.range(c.rule_kind);
+        let (min, max) = field.range();
         if range.start() != min || range.end() != max {
             commands.entity(entity).insert(SliderRange::new(min, max));
         }
@@ -1072,9 +1376,8 @@ fn sync(
             Toggle::Clustered => s.clustered,
             Toggle::Preferred => s.behavior.preferred_enabled,
             Toggle::Density => s.behavior.density_enabled,
+            Toggle::Nova => s.behavior.nova_enabled,
             Toggle::Trails => s.trails.enabled,
-            Toggle::Detection => s.detection.enabled,
-            Toggle::Evolution => s.evolution.enabled,
         };
         if value != checked {
             if value {
@@ -1096,8 +1399,7 @@ fn sync(
     }
     for (action, mut variant, children) in &mut actions {
         let selected = match action {
-            Action::Tab(i) => c.tab == *i,
-            Action::Kind(k) => c.rule_kind == *k,
+            Action::Tool(_) => continue,
             Action::Exact(v) => s.exact == *v,
             _ => false,
         };
@@ -1132,15 +1434,16 @@ fn sync(
             Info::Message => report.message.clone(),
             Info::Error => c.error.clone(),
             Info::Active => format!("Active: {} particles · {} types", s.count, s.types),
-            Info::Rule => c.rule_kind.hint().into(),
-            Info::Selection => {
-                let v = Field::Rule.value(&s, &a, &c);
+            Info::Rule(kind) => kind.hint().into(),
+            Info::Selection(kind) => {
+                let selected = c.selected[*kind as usize];
+                let v = Field::Rule(*kind).value(&s, &a, &c);
                 let mut t = format!(
                     "Type {} feels type {}: {v:+.3}",
-                    c.selected.0 + 1,
-                    c.selected.1 + 1
+                    selected.0 + 1,
+                    selected.1 + 1
                 );
-                if c.rule_kind == RuleKind::Distance && v > 0. {
+                if *kind == RuleKind::Distance && v > 0. {
                     t += &format!(
                         "\nPreferred separation: {:.1} world units (at least the repulsion core).",
                         v.max(0.2) * s.radius
@@ -1160,7 +1463,7 @@ fn sync(
                     String::new()
                 }
             }
-            Info::Hover => continue,
+            Info::Hover(_) => continue,
         };
         if t.0 != next {
             t.0 = next;
@@ -1218,6 +1521,8 @@ fn input(
     window: Single<&Window, With<PrimaryWindow>>,
     mut focus: ResMut<InputFocus>,
     mut c: ResMut<Controls>,
+    mut tools: ResMut<InteractionTools>,
+    sim: Res<Simulation>,
     mut a: ResMut<Appearance>,
     mut commands: Commands,
     parents: Query<&ChildOf>,
@@ -1235,11 +1540,30 @@ fn input(
     let on_background = cursor
         .is_some_and(|p| p.x >= origin.x && p.y >= 0. && p.x < origin.x + size.x && p.y < size.y)
         && !over_ui;
-    if buttons.any_just_pressed([MouseButton::Left, MouseButton::Middle]) {
+    let on_background = on_background && window.focused;
+    if buttons.just_pressed(MouseButton::Middle) {
         c.dragging = on_background;
+        c.brushing = false;
+        c.pointer_start = None;
         if on_background {
             focus.set(*background, FocusCause::Navigated);
         }
+    }
+    if buttons.just_pressed(MouseButton::Left) && !buttons.pressed(MouseButton::Middle) {
+        c.pointer_start = cursor.filter(|_| on_background);
+        c.pointer_moved = false;
+        c.brushing = on_background && tools.tool != Tool::Navigate;
+        c.dragging = on_background && tools.tool == Tool::Navigate;
+        if on_background {
+            focus.set(*background, FocusCause::Navigated);
+        }
+    }
+    if let (Some(start), Some(cursor)) = (c.pointer_start, cursor) {
+        c.pointer_moved |= cursor.distance(start) > 4.;
+    }
+    if buttons.just_released(MouseButton::Left) {
+        c.pointer_start = None;
+        c.brushing = false;
     }
     if !buttons.any_pressed([MouseButton::Left, MouseButton::Middle]) {
         c.dragging = false;
@@ -1253,7 +1577,13 @@ fn input(
             };
         if on_background {
             if let Some(cursor) = cursor {
-                a.zoom_at_cursor(cursor - origin, size, delta.y);
+                if tools.tool != Tool::Navigate
+                    && keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight])
+                {
+                    tools.radius = (tools.radius * (delta.y * 0.004).exp()).clamp(8., 512.);
+                } else {
+                    a.zoom_at_cursor(cursor - origin, size, delta.y);
+                }
             }
         } else {
             let mut delta = -delta;
@@ -1280,13 +1610,24 @@ fn input(
             }
         }
     }
-    if c.dragging && on_background {
+    if c.dragging && on_background && (buttons.pressed(MouseButton::Middle) || c.pointer_moved) {
         let scale = 2. / size.y.max(1.) / a.zoom;
         a.pan += Vec2::new(-motion.delta.x, motion.delta.y) * scale;
         a.wrap_pan();
     }
+    tools.cursor = cursor
+        .filter(|_| on_background)
+        .map(|cursor| cursor_world(&a, cursor - origin, size));
+    tools.active = c.brushing
+        && buttons.pressed(MouseButton::Left)
+        && !buttons.pressed(MouseButton::Middle)
+        && on_background
+        && (!sim.paused || tools.tool == Tool::Dump);
     if !window.focused {
         c.dragging = false;
+        c.brushing = false;
+        c.pointer_start = None;
+        tools.active = false;
     }
 }
 /// Inclusive headers at index zero; only allocate cells intersecting the viewport.
@@ -1305,108 +1646,125 @@ fn matrix(
     mut commands: Commands,
     s: Res<Simulation>,
     c: Res<Controls>,
-    viewport: Single<(&ScrollPosition, &ComputedNode), With<MatrixViewport>>,
-    mut content: Single<(Entity, &mut Node), With<MatrixContent>>,
+    viewports: Query<(&MatrixViewport, &ScrollPosition, &ComputedNode)>,
+    mut contents: Query<(Entity, &MatrixContent, &mut Node)>,
+    parents: Query<&ChildOf>,
+    sections: Query<&Node, (With<SectionBody>, Without<MatrixContent>)>,
     cells: Query<(Entity, &MatrixCell)>,
     hover: Res<HoverMap>,
     mut labels: Query<(&Info, &mut Text)>,
-    mut previous: Local<Option<(UVec2, UVec2, u64, u32, usize, RuleKind, (u32, u32))>>,
+    mut previous: Local<[Option<(UVec2, UVec2, u64, u32, usize, RuleKind, (u32, u32))>; 4]>,
 ) {
-    if !c.visible || c.tab != 2 {
+    if !c.visible {
         return;
     }
-    let (pos, computed) = *viewport;
-    let (first, end) = visible_cells(
-        pos.0,
-        computed.size() * computed.inverse_scale_factor(),
-        s.types,
-    );
-    let key = (
-        first,
-        end,
-        s.rules_revision,
-        s.types,
-        s.palette,
-        c.rule_kind,
-        c.selected,
-    );
-    let mut hover_text = String::new();
-    for map in hover.values() {
-        for entity in map.keys() {
-            if let Ok((_, MatrixCell(y, x))) = cells.get(*entity)
-                && *x > 0
-                && *y > 0
-            {
-                let v = s.matrix(c.rule_kind)[((*y - 1) * s.types + *x - 1) as usize];
-                hover_text = format!("{} feels {}: {v:+.3}", y, x);
-            }
+    for (parent, content, mut node) in &mut contents {
+        let kind = content.0;
+        let selected = c.selected[kind as usize];
+        if parents.iter_ancestors(parent).any(|entity| {
+            sections
+                .get(entity)
+                .is_ok_and(|node| node.display == Display::None)
+        }) {
+            continue;
         }
-    }
-    for (kind, mut t) in &mut labels {
-        if matches!(kind, Info::Hover) && t.0 != hover_text {
-            t.0 = hover_text.clone();
-        }
-    }
-    if previous.as_ref() == Some(&key) {
-        return;
-    }
-    *previous = Some(key);
-    for (entity, _) in &cells {
-        commands.entity(entity).despawn();
-    }
-    let (parent, node) = &mut *content;
-    node.width = px((s.types as f32 + 1.) * 30.);
-    node.height = node.width;
-    for y in first.y..end.y {
-        for x in first.x..end.x {
-            let mut node = Node {
-                position_type: PositionType::Absolute,
-                left: px(x as f32 * 30.),
-                top: px(y as f32 * 30.),
-                width: px(28),
-                height: px(28),
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::Center,
-                border_radius: BorderRadius::all(px(4)),
-                ..default()
-            };
-            if x == 0 || y == 0 {
-                let id = commands
-                    .spawn((node, MatrixCell(y, x), ChildOf(*parent)))
-                    .id();
-                if x + y > 0 {
-                    let label = text(&mut commands, id, x.max(y).to_string());
-                    commands
-                        .entity(label)
-                        .remove::<ThemedText>()
-                        .insert(TextColor(type_color(&s, x.max(y) - 1)));
+        let Some((_, pos, computed)) = viewports.iter().find(|(view, _, _)| view.0 == kind) else {
+            continue;
+        };
+        let (first, end) = visible_cells(
+            pos.0,
+            computed.size() * computed.inverse_scale_factor(),
+            s.types,
+        );
+        let key = (
+            first,
+            end,
+            s.rules_revision,
+            s.types,
+            s.palette,
+            kind,
+            selected,
+        );
+        let mut hover_text = String::new();
+        for map in hover.values() {
+            for entity in map.keys() {
+                if let Ok((_, MatrixCell(cell_kind, y, x))) = cells.get(*entity)
+                    && *cell_kind == kind
+                    && *x > 0
+                    && *y > 0
+                {
+                    let v = s.matrix(kind)[((*y - 1) * s.types + *x - 1) as usize];
+                    hover_text = format!("{} feels {}: {v:+.3}", y, x);
                 }
-                continue;
             }
-            let v = s.matrix(c.rule_kind)[((y - 1) * s.types + x - 1) as usize];
-            let intensity = (v.abs() * 180.) as u8;
-            let color = if v >= 0. {
-                Color::srgb_u8(28, 55 + intensity / 2, 65 + intensity)
-            } else {
-                Color::srgb_u8(65 + intensity, 35 + intensity / 3, 40)
-            };
-            if c.selected == (y - 1, x - 1) {
-                node.border = UiRect::all(px(2));
+        }
+        for (info, mut t) in &mut labels {
+            if matches!(info, Info::Hover(k) if *k == kind) && t.0 != hover_text {
+                t.0 = hover_text.clone();
             }
-            commands
-                .spawn((
-                    node,
-                    BackgroundColor(color),
-                    BorderColor::all(Color::WHITE),
-                    MatrixCell(y, x),
-                    Action::Cell(y - 1, x - 1),
-                    ChildOf(*parent),
-                ))
-                .observe(|event: On<Pointer<Click>>, mut commands: Commands| {
-                    commands.trigger(Activate {
-                        entity: event.entity,
+        }
+        if previous[kind as usize].as_ref() == Some(&key) {
+            continue;
+        }
+        previous[kind as usize] = Some(key);
+        for (entity, cell) in &cells {
+            if cell.0 == kind {
+                commands.entity(entity).despawn();
+            }
+        }
+        node.width = px((s.types as f32 + 1.) * 30.);
+        node.height = node.width;
+        for y in first.y..end.y {
+            for x in first.x..end.x {
+                let mut node = Node {
+                    position_type: PositionType::Absolute,
+                    left: px(x as f32 * 30.),
+                    top: px(y as f32 * 30.),
+                    width: px(28),
+                    height: px(28),
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    border_radius: BorderRadius::all(px(4)),
+                    ..default()
+                };
+                if x == 0 || y == 0 {
+                    let id = commands
+                        .spawn((node, MatrixCell(kind, y, x), ChildOf(parent)))
+                        .id();
+                    if x + y > 0 {
+                        let label = text(&mut commands, id, x.max(y).to_string());
+                        commands
+                            .entity(label)
+                            .remove::<ThemedText>()
+                            .insert(TextColor(type_color(&s, x.max(y) - 1)));
+                    }
+                    continue;
+                }
+                let v = s.matrix(kind)[((y - 1) * s.types + x - 1) as usize];
+                let intensity = (v.abs() * 180.) as u8;
+                let color = if v >= 0. {
+                    Color::srgb_u8(28, 55 + intensity / 2, 65 + intensity)
+                } else {
+                    Color::srgb_u8(65 + intensity, 35 + intensity / 3, 40)
+                };
+                if selected == (y - 1, x - 1) {
+                    node.border = UiRect::all(px(2));
+                }
+                commands
+                    .spawn((
+                        node,
+                        BackgroundColor(color),
+                        BorderColor::all(Color::WHITE),
+                        MatrixCell(kind, y, x),
+                        Action::Cell(kind, y - 1, x - 1),
+                        ChildOf(parent),
+                    ))
+                    .observe(|event: On<Pointer<Click>>, mut commands: Commands| {
+                        commands.trigger(Activate {
+                            entity: event.entity,
+                        });
                     });
-                });
+            }
         }
     }
 }
@@ -1414,6 +1772,7 @@ fn matrix(
 fn shortcut(
     mut event: On<FocusedInput<KeyboardInput>>,
     mut c: ResMut<Controls>,
+    mut tools: ResMut<InteractionTools>,
     mut s: ResMut<Simulation>,
     mut window: Single<&mut Window, With<PrimaryWindow>>,
 ) {
@@ -1423,6 +1782,13 @@ fn shortcut(
         return;
     }
     match event.input.key_code {
+        KeyCode::Escape => {
+            tools.tool = Tool::Navigate;
+            tools.active = false;
+            c.brushing = false;
+            c.dragging = false;
+            c.pointer_start = None;
+        }
         KeyCode::Tab => c.visible = !c.visible,
         KeyCode::Space => s.paused = !s.paused,
         KeyCode::ArrowRight if s.paused => s.step += 1,
@@ -1501,11 +1867,14 @@ fn scrollbar(commands: &mut Commands, parent: Entity, target: Entity, vertical: 
 mod tests {
     use super::*;
     #[test]
-    fn feathers_tree_switches_tabs_and_dispatches_keyboard_input() {
+    fn feathers_sections_preserve_state_and_dispatch_keyboard_input() {
         let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            .init_asset::<bevy::shader::Shader>();
         app.add_plugins(
             DefaultPlugins
                 .build()
+                .disable::<AssetPlugin>()
                 .disable::<bevy::winit::WinitPlugin>()
                 .disable::<bevy::render::RenderPlugin>()
                 .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>()
@@ -1546,23 +1915,151 @@ mod tests {
         );
         press(&mut app, KeyCode::Tab, bevy::input::keyboard::Key::Tab);
         assert!(app.world().resource::<Controls>().visible);
-        for tab in 0..3 {
+        let sections: Vec<_> = app
+            .world_mut()
+            .query::<(Entity, &SectionToggle, Has<Checked>)>()
+            .iter(app.world())
+            .map(|(e, section, checked)| (e, section.0, checked))
+            .collect();
+        assert_eq!(sections.len(), 10);
+        assert_eq!(
+            sections.iter().filter(|(_, _, checked)| *checked).count(),
+            1
+        );
+        for (_, body, checked) in &sections {
+            assert_eq!(
+                app.world().get::<Node>(*body).unwrap().display == Display::Flex,
+                *checked
+            );
+        }
+        // All section roots share one scrollable body. Only the first starts open.
+        let mut section_parents = Vec::new();
+        for (_, body, _) in &sections {
+            let root = app.world().get::<ChildOf>(*body).unwrap().parent();
+            section_parents.push(app.world().get::<ChildOf>(root).unwrap().parent());
+        }
+        assert!(
+            section_parents
+                .iter()
+                .all(|parent| *parent == section_parents[0])
+        );
+        assert!(
+            app.world()
+                .get::<ScrollPosition>(section_parents[0])
+                .is_some()
+        );
+        // Keyboard activation closes an expanded section.
+        let section_for = |app: &mut App, field: Field| {
             let entity = app
                 .world_mut()
-                .query::<(Entity, &Action)>()
+                .query::<(Entity, &Field)>()
                 .iter(app.world())
-                .find_map(|(e, a)| matches!(a,Action::Tab(i) if *i==tab).then_some(e))
+                .find_map(|(e, f)| (*f == field).then_some(e))
                 .unwrap();
-            app.world_mut().trigger(Activate { entity });
-            app.update();
-            assert_eq!(app.world().resource::<Controls>().tab, tab);
-            for (body, node) in app
-                .world_mut()
-                .query::<(&TabBody, &Node)>()
-                .iter(app.world())
-            {
-                assert_eq!(node.display == Display::Flex, body.0 == tab);
+            let mut ancestor = entity;
+            while app.world().get::<SectionBody>(ancestor).is_none() {
+                ancestor = app.world().get::<ChildOf>(ancestor).unwrap().parent();
             }
+            *sections
+                .iter()
+                .find(|(_, body, _)| *body == ancestor)
+                .unwrap()
+        };
+        let (toggle, body, _) = section_for(&mut app, Field::DensityTarget);
+        app.world_mut().trigger(ValueChange {
+            source: toggle,
+            value: true,
+            is_final: true,
+        });
+        app.update();
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(toggle, FocusCause::Navigated);
+        press(&mut app, KeyCode::Space, bevy::input::keyboard::Key::Space);
+        assert_eq!(
+            app.world().get::<Node>(body).unwrap().display,
+            Display::None
+        );
+        assert!(app.world().get::<Checked>(toggle).is_none());
+        // Reopening a different section leaves the first one collapsed.
+        let (other_toggle, other_body, _) =
+            section_for(&mut app, Field::Rule(RuleKind::Attraction));
+        app.world_mut().trigger(ValueChange {
+            source: other_toggle,
+            value: true,
+            is_final: true,
+        });
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(other_body).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(body).unwrap().display,
+            Display::None
+        );
+        let rule = app
+            .world_mut()
+            .query::<(Entity, &Field)>()
+            .iter(app.world())
+            .find_map(|(e, f)| matches!(f, Field::Rule(RuleKind::Attraction)).then_some(e))
+            .unwrap();
+        app.world_mut().trigger(ValueChange {
+            source: rule,
+            value: 0.25f32,
+            is_final: true,
+        });
+        app.update();
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(rule, FocusCause::Navigated);
+        app.world_mut().trigger(ValueChange {
+            source: other_toggle,
+            value: false,
+            is_final: true,
+        });
+        app.update();
+        assert_eq!(
+            app.world().resource::<InputFocus>().get(),
+            Some(other_toggle)
+        );
+        assert_eq!(app.world().get::<TabIndex>(rule).unwrap().0, -1);
+        app.world_mut().resource_mut::<Controls>().visible = false;
+        app.update();
+        app.world_mut().resource_mut::<Controls>().visible = true;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(other_body).unwrap().display,
+            Display::None
+        );
+        app.world_mut().trigger(ValueChange {
+            source: other_toggle,
+            value: true,
+            is_final: true,
+        });
+        app.update();
+        assert_eq!(app.world().get::<SliderValue>(rule).unwrap().0, 0.25);
+        assert_eq!(app.world().get::<TabIndex>(rule).unwrap().0, 0);
+        for kind in RuleKind::ALL {
+            let (toggle, _, _) = section_for(&mut app, Field::Rule(kind));
+            app.world_mut().trigger(ValueChange {
+                source: toggle,
+                value: true,
+                is_final: true,
+            });
+        }
+        app.update();
+        app.update();
+        for kind in RuleKind::ALL {
+            assert!(
+                app.world_mut()
+                    .query::<&MatrixCell>()
+                    .iter(app.world())
+                    .any(|cell| cell.0 == kind)
+            );
+        }
+        for font in app.world_mut().query::<&TextFont>().iter(app.world()) {
+            assert_eq!(font.font_size, bevy::text::FontSize::Px(11.0));
         }
         let speed = app
             .world_mut()
@@ -1589,6 +2086,7 @@ mod tests {
     fn controls_app() -> App {
         let mut app = App::new();
         app.init_resource::<Simulation>()
+            .init_resource::<InteractionTools>()
             .init_resource::<Appearance>()
             .init_resource::<Controls>()
             .init_resource::<Status>()
@@ -1663,7 +2161,7 @@ mod tests {
         app.world_mut().trigger(Activate { entity: apply });
         let s = app.world().resource::<Simulation>();
         assert_eq!((s.count, s.types, s.epoch), (1000, 4, before + 1));
-        assert_eq!(app.world().resource::<Controls>().selected, (0, 0));
+        assert_eq!(app.world().resource::<Controls>().selected, [(0, 0); 4]);
     }
     #[test]
     fn sidebar_bounds_follow_dpi_and_visibility() {
@@ -1733,20 +2231,81 @@ mod tests {
         );
     }
     #[test]
+    fn rule_panels_edit_and_clear_only_their_own_matrix() {
+        let mut app = controls_app();
+        for (index, kind) in RuleKind::ALL.into_iter().enumerate() {
+            let cell = app
+                .world_mut()
+                .spawn(Action::Cell(kind, index as u32, 1))
+                .id();
+            app.world_mut().trigger(Activate { entity: cell });
+            let field = app.world_mut().spawn(Field::Rule(kind)).id();
+            app.world_mut().trigger(ValueChange {
+                source: field,
+                value: 0.1 * (index + 1) as f32,
+                is_final: true,
+            });
+        }
+        for (index, kind) in RuleKind::ALL.into_iter().enumerate() {
+            let s = app.world().resource::<Simulation>();
+            let c = app.world().resource::<Controls>();
+            assert_eq!(c.selected[index], (index as u32, 1));
+            assert_eq!(
+                Field::Rule(kind).value(s, &Appearance::default(), c),
+                0.1 * (index + 1) as f32
+            );
+        }
+        let before: Vec<_> = RuleKind::ALL
+            .into_iter()
+            .map(|kind| app.world().resource::<Simulation>().matrix(kind).to_vec())
+            .collect();
+        let zero = app.world_mut().spawn(Action::Zero(RuleKind::Swirl)).id();
+        app.world_mut().trigger(Activate { entity: zero });
+        assert!(
+            app.world()
+                .resource::<Simulation>()
+                .matrix(RuleKind::Swirl)
+                .iter()
+                .all(|v| *v == 0.)
+        );
+        let randomize = app
+            .world_mut()
+            .spawn(Action::Randomize(RuleKind::Swirl))
+            .id();
+        app.world_mut().trigger(Activate { entity: randomize });
+        assert!(
+            app.world()
+                .resource::<Simulation>()
+                .matrix(RuleKind::Swirl)
+                .iter()
+                .any(|v| *v != 0.)
+        );
+        for kind in [
+            RuleKind::Attraction,
+            RuleKind::Alignment,
+            RuleKind::Distance,
+        ] {
+            assert_eq!(
+                app.world().resource::<Simulation>().matrix(kind).as_slice(),
+                before[kind as usize].as_slice()
+            );
+        }
+    }
+    #[test]
     fn rules_edit_selected_matrix_and_keep_distance_nonnegative() {
         let mut s = Simulation::default();
         let mut a = Appearance::default();
         let c = Controls {
-            rule_kind: RuleKind::Distance,
-            selected: (1, 2),
+            selected: [(1, 2); 4],
             ..default()
         };
         let revision = s.rules_revision;
-        let index = (c.selected.0 * s.types + c.selected.1) as usize;
-        Field::Rule.set(-0.5, &mut s, &mut a, &c);
+        let index = (c.selected[RuleKind::Distance as usize].0 * s.types
+            + c.selected[RuleKind::Distance as usize].1) as usize;
+        Field::Rule(RuleKind::Distance).set(-0.5, &mut s, &mut a, &c);
         assert_eq!(s.matrix(RuleKind::Distance)[index], 0.);
         assert_eq!(s.rules_revision, revision + 1);
-        Field::Rule.set(1., &mut s, &mut a, &c);
+        Field::Rule(RuleKind::Distance).set(1., &mut s, &mut a, &c);
         assert_eq!(s.matrix(RuleKind::Distance)[index], 0.95);
     }
 }

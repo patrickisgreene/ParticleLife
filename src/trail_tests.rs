@@ -242,11 +242,6 @@ fn particle_spacing_crowding_and_cycles() {
                 types,
                 vec![0; 16],
                 particles.clone(),
-                // Creature registry and per-creature genomes. Detection is off
-                // here, but `update` still references both bindings, so they
-                // must be present in the layout.
-                vec![0; 4096 * 36],
-                vec![0; 4096 * 16 * 2],
             ];
             let buffers: Vec<_> = contents
                 .iter()
@@ -371,5 +366,189 @@ fn particle_spacing_crowding_and_cycles() {
             0,
             "off preserves type"
         );
+    });
+}
+
+/// A tight same-type knot ignites: the shell latches an outward direction and
+/// burns, while the symmetric core, which has no escape direction, is reseeded
+/// somewhere else in the world.
+#[test]
+#[ignore = "requires a Vulkan GPU; run cargo test -- --ignored"]
+fn novae_eject_dense_clumps_and_reseed_the_core() {
+    pollster::block_on(async {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .expect("Vulkan adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .unwrap();
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("production simulation"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../assets/shaders/simulation.wgsl").into(),
+            ),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &shader,
+            entry_point: Some("update"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        // One type, no attraction and no damping, so the only forces in play are
+        // the unconditional core repulsion and the nova impulse under test.
+        let run = |xs: &[f32], threshold: f32| -> Vec<u32> {
+            let n = xs.len() as u32;
+            let mut params = [0u32; 56];
+            params[..4].copy_from_slice(&[n, 1, 3, 42]);
+            params[4] = 0.02f32.to_bits(); // dt
+            params[5] = 40.0f32.to_bits(); // interaction radius
+            params[6] = 1.0f32.to_bits(); // strength
+            params[8] = 100.0f32.to_bits(); // world size
+            params[9] = 0.2f32.to_bits(); // core fraction
+            params[10] = 180.0f32.to_bits(); // speed limit
+            params[20] = 1; // exact: count every candidate, no sampling noise
+            params[31] = 1.0f32.to_bits();
+            params[40] = 256.0f32.to_bits();
+            params[52] = threshold.to_bits(); // 0 disables ignition
+            params[53] = 0.35f32.to_bits(); // ignition radius fraction
+            params[54] = 1800.0f32.to_bits(); // blast strength
+            params[55] = 0.3f32.to_bits(); // blast duration
+            // All in the middle cell of the 3x3 grid, so `sorted` order is input order.
+            let mut particles = vec![0u32; n as usize * 8];
+            for (i, x) in xs.iter().enumerate() {
+                particles[i * 8] = x.to_bits();
+                particles[i * 8 + 1] = 50.0f32.to_bits();
+            }
+            let mut cells = vec![0u32; 9 * 4];
+            cells[4 * 4] = n;
+            let neighbors: Vec<u32> = (0..n as usize)
+                .flat_map(|i| [particles[i * 8], particles[i * 8 + 1], 0, 0])
+                .collect();
+            let contents = [
+                params.to_vec(),
+                particles.clone(),
+                vec![0; particles.len()],
+                cells,
+                neighbors,
+                vec![0],
+                vec![0u32; 4 + 4],
+                vec![0; 16],
+                particles.clone(),
+            ];
+            let buffers: Vec<_> = contents
+                .iter()
+                .enumerate()
+                .map(|(i, data)| {
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytemuck::cast_slice(data),
+                        usage: if i == 0 {
+                            wgpu::BufferUsages::UNIFORM
+                        } else {
+                            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC
+                        },
+                    })
+                })
+                .collect();
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &buffers
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != 1)
+                    .map(|(i, b)| wgpu::BindGroupEntry {
+                        binding: i as u32,
+                        resource: b.as_entire_binding(),
+                    })
+                    .collect::<Vec<_>>(),
+            });
+            let size = n as u64 * 32;
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&buffers[2], 0, &readback, 0, size);
+            queue.submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx.send(result).unwrap();
+                });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(10)),
+                })
+                .unwrap();
+            rx.recv().unwrap().unwrap();
+            bytemuck::cast_slice(&readback.slice(..).get_mapped_range()).to_vec()
+        };
+        let at = |data: &[u32], i: usize| {
+            (
+                f32::from_bits(data[i * 8]),     // position x
+                f32::from_bits(data[i * 8 + 1]), // position y
+                f32::from_bits(data[i * 8 + 2]), // velocity x
+                f32::from_bits(data[i * 8 + 6]), // remaining burn time
+            )
+        };
+        // Five particles one unit apart: every one has four same-type neighbours
+        // well inside the 14-unit ignition radius.
+        let clump = [48., 49., 50., 51., 52.];
+        let quiet = run(&clump, 100.); // threshold far out of reach
+        let burst = run(&clump, 4.);
+        let off = run(&clump, 0.); // rule disabled entirely
+
+        let (_, _, quiet_vx, quiet_burn) = at(&quiet, 0);
+        let (_, _, burst_vx, burst_burn) = at(&burst, 0);
+        assert_eq!(quiet_burn, 0., "below threshold nothing ignites");
+        assert!(burst_burn > 0., "the shell is burning");
+        assert!(burst_burn < 0.3, "the burn timer counts down");
+        assert!(burst_vx < 0., "the left edge is thrown further left");
+        assert!(
+            burst_vx < quiet_vx * 2.,
+            "the blast dominates core repulsion: {burst_vx} vs {quiet_vx}"
+        );
+
+        // The middle particle's neighbours cancel exactly, so it is the core.
+        let (core_x, core_y, core_vx, core_burn) = at(&burst, 2);
+        assert_eq!(core_burn, 0., "a reseeded particle does not burn");
+        assert_eq!(core_vx, 0., "a reseeded particle starts at rest");
+        assert!(
+            (0.0..100.).contains(&core_x) && (0.0..100.).contains(&core_y),
+            "reseeded inside the world: ({core_x}, {core_y})"
+        );
+        assert!(
+            (core_x - 50.).hypot(core_y - 50.) > 5.,
+            "reseeded away from the clump: ({core_x}, {core_y})"
+        );
+        assert_eq!(at(&quiet, 2).0, 50., "below threshold the core stays put");
+
+        for i in 0..clump.len() {
+            assert_eq!(at(&off, i).3, 0., "disabled leaves the burn timer clear");
+            assert_eq!(
+                at(&off, i).2,
+                at(&quiet, i).2,
+                "disabled matches a world that never reaches the threshold"
+            );
+        }
     });
 }

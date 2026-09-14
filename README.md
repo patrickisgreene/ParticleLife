@@ -1,5 +1,7 @@
 # Particle Life
 
+![ScreenShot](./screenshots/screenshot_1.png)
+
 A native Bevy playground with GPU particle simulation, directional attraction,
 swirl, velocity alignment, preferred spacing, crowding response, type cycles, and chemical trails.
 
